@@ -54,7 +54,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat, StandardTopKOutput
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -275,7 +275,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -290,10 +290,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-
         if (
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
+            and not get_moe_a2a_backend().is_mori()
         ):
             return self.forward_normal(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
@@ -356,6 +356,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+        
+        topk_output = StandardTopKOutput(topk_output.topk_weights, topk_output.topk_ids.to(torch.int32),
+                                                  topk_output.router_logits)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,

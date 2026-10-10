@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import torch
@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.utils import is_hip
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -189,6 +190,18 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            # PyHIP's GR write is built for 4 branches of 2560 with per-branch norm.
+            self._gr_write_ok = (
+                envs.SGLANG_USE_PYHIP_GR_WRITE.get()
+                and is_hip()
+                and torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).gcnArchName.startswith("gfx942")
+                and (self.hc_count, self.hidden_size) == (4, 2560)
+                and self.config.hc_per_branch_norm
+                and config.params_dtype == torch.bfloat16
+            )
+            self._gr_write_weights = None
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -228,7 +241,11 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
-    def mix(self, hyper_input: torch.Tensor):
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        hyper_input_normed: Optional[torch.Tensor] = None,
+    ):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -236,9 +253,9 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed_input, (hyper_input, hyper_input)
 
-        if self.config.hc_per_branch_norm:
+        if hyper_input_normed is None and self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
-        else:
+        elif hyper_input_normed is None:
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
@@ -334,6 +351,47 @@ class GatedResidual(HyperConnectionBase):
             self.hidden_size,
         ).to(self.params_dtype)
         return updated_residuals
+
+    def combine_and_norm(
+        self,
+        block_output: torch.Tensor,
+        residuals,
+        consumer: Optional["GatedResidual"],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """(combine(), consumer.hc_norm of it) when fused, else (combine(), None)."""
+        hyper_input, hyper_input_normed = residuals
+        if (
+            consumer is not None
+            and self._gr_write_ok
+            # Prefill only: decode-size batches and graph captures keep SGLang's combine.
+            and block_output.shape[0] > 32
+            and not torch.cuda.is_current_stream_capturing()
+            and block_output.dtype == torch.bfloat16
+            and hyper_input.dtype == torch.bfloat16
+            and hyper_input_normed.dtype == torch.bfloat16
+            and consumer.hc_norm.weight.dtype == torch.bfloat16
+        ):
+            from pyhip.ops.gr_write import gr_write, prepare_weights
+
+            if (
+                self._gr_write_weights is None
+                or self._gr_write_weights[0] is not consumer
+            ):
+                self._gr_write_weights = (
+                    consumer,
+                    *prepare_weights(
+                        self.block_inject_weight.weight.data,
+                        consumer.hc_norm.weight.data,
+                    ),
+                )
+            return gr_write(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                *self._gr_write_weights[1:],
+                eps=consumer.hc_norm.variance_epsilon,
+            )
+        return self.combine(block_output, residuals), None
 
 
 HYPERCONNECTION_CLASS_DICT = {

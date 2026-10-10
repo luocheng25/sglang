@@ -1303,7 +1303,7 @@ class Qwen4ExpLayerExtensionMixin:
     def _prepare_qwen4_exp_attn(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        hyper_input_normed: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
@@ -1323,14 +1323,15 @@ class Qwen4ExpLayerExtensionMixin:
                     )
                 self.ple.forward_idle(forward_batch)
             else:
-                ple_query = (
-                    hidden_states if residual is None else hidden_states + residual
-                )
                 hidden_states = hidden_states + self.ple(
-                    ple_query, forward_batch, ple_batch
+                    hidden_states, forward_batch, ple_batch
                 )
+            # PLE edits the hyper input after any hc_norm fused upstream.
+            hyper_input_normed = None
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hidden_states, hyper_input_normed
+        )
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1341,8 +1342,10 @@ class Qwen4ExpLayerExtensionMixin:
     ):
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states, normed = self.attn_hyper_connection.combine_and_norm(
+            hidden_states, residual, self.mlp_hyper_connection
+        )
+        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states, normed)
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1407,9 +1410,12 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        hc_consumer: Optional[GatedResidual],
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
-        return hidden_states, None
+        # The second slot carries hc_consumer's norm of the output when fused.
+        return self.mlp_hyper_connection.combine_and_norm(
+            hidden_states, residual, hc_consumer
+        )
 
 
 class Qwen4ExpLinearDecoderLayer(
@@ -1449,7 +1455,9 @@ class Qwen4ExpLinearDecoderLayer(
             hidden_states, residual, forward_batch
         )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states, residual, forward_batch, kwargs.get("hc_consumer")
+        )
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -1597,7 +1605,9 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states, residual, forward_batch
         )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states, residual, forward_batch, kwargs.get("hc_consumer")
+        )
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1644,6 +1654,17 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        # The hyper connection whose hc_norm first reads each layer's output; None
+        # where PLE edits that output first or a later pipeline stage reads it.
+        self._hc_consumers = {}
+        for i in range(self.start_layer, self.end_layer):
+            if i + 1 == len(self.layers):
+                consumer = self.hyper_connection_mixer
+            elif i + 1 == self.end_layer or self.layers[i + 1].ple is not None:
+                consumer = None
+            else:
+                consumer = self.layers[i + 1].attn_hyper_connection
+            self._hc_consumers[i] = consumer
 
     def forward(
         self,
@@ -1667,6 +1688,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.has_ple
             else None
         )
+        # Between layers, residual carries the fused hc_norm of hidden_states or None.
         residual = None
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
@@ -1682,6 +1704,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     residual=residual,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
+                    hc_consumer=self._hc_consumers[i],
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -1692,7 +1715,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states, residual)
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 

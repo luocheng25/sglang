@@ -306,6 +306,8 @@ class Envs:
     SGLANG_USE_PYHIP_QSA = EnvBool(False)
     # Numerical acceptance only; never enable for performance measurements.
     SGLANG_TEST_PYHIP_QSA = EnvBool(False)
+    # gfx942 PyHIP GR write: eager hc_combine fused with the next hc_norm.
+    SGLANG_USE_PYHIP_GR_WRITE = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

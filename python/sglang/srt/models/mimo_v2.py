@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
 import itertools
 import logging
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -256,14 +259,14 @@ class _MimoSpSwaMetadata:
 
     Keys of every request segment in this rank's token slice are packed into page-64
     SHUFFLE-5D pages: cached keys left of the chunk, keys from earlier slices, then the
-    slice's own keys. kv_src indexes rows of cat([cached, tails, own, zero])."""
+    slice's own keys. kv_src indexes rows of [cached, tails, own, zero] (not materialized).
+    """
 
     key: Tuple[int, int]
     q_rows: int
     tail_rows: int
     cache_rows: int
-    cache_page: Optional[torch.Tensor]
-    cache_offset: Optional[torch.Tensor]
+    cache_loc: Optional[torch.Tensor]
     kv_src: torch.Tensor
     cu_seqlens_q: torch.Tensor
     kv_indptr: torch.Tensor
@@ -323,7 +326,7 @@ def _mimo_sp_swa_metadata(
         max_q, max_kv = max(max_q, qb - qa), max(max_kv, keys)
 
     device = forward_batch.positions.device
-    cache_page = cache_offset = None
+    cache_loc = None
     if cache_rows:
         from sglang.srt.model_executor.forward_context import (
             get_req_to_token_pool,
@@ -339,12 +342,11 @@ def _mimo_sp_swa_metadata(
         full_loc = get_req_to_token_pool().req_to_token[
             forward_batch.req_pool_indices[req_rows].long(), positions
         ]
-        swa_loc = (
+        cache_loc = (
             get_token_to_kv_pool()
             .translate_loc_from_full_to_swa(full_loc.long())
             .long()
         )
-        cache_page, cache_offset = swa_loc // _SP_SWA_PAGE, swa_loc % _SP_SWA_PAGE
 
     def to_device(values, dtype):
         return torch.tensor(values, dtype=dtype).to(device, non_blocking=True)
@@ -354,8 +356,7 @@ def _mimo_sp_swa_metadata(
         q_rows=cu_q[-1],
         tail_rows=tail,
         cache_rows=cache_rows,
-        cache_page=cache_page,
-        cache_offset=cache_offset,
+        cache_loc=cache_loc,
         kv_src=(torch.cat(kv_src) if kv_src else torch.empty(0, dtype=torch.int64)).to(
             device, non_blocking=True
         ),
@@ -368,6 +369,121 @@ def _mimo_sp_swa_metadata(
     )
     forward_batch._mimo_sp_swa_metadata = meta
     return meta
+
+
+@triton.jit
+def _mimo_sp_swa_send_kernel(
+    k_ptr,
+    v_ptr,
+    send_ptr,
+    tail_ptr,
+    k_stride,
+    v_stride,
+    v_scale,
+    rows,
+    tail_start,
+    HEADS: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    DQ: tl.constexpr,
+    DV: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    HAS_V_SCALE: tl.constexpr,
+):
+    """send[r, t] = [K | V] of rank r's KV heads for token t (V scaled); tokens from
+    tail_start on also go to tail[t - tail_start] = [K | V] of all KV heads."""
+    rank = tl.program_id(1)
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)[:, None]
+    ck = tl.arange(0, BLOCK_K)[None, :]
+    cv = tl.arange(0, BLOCK_V)[None, :]
+    k_mask = (t < rows) & (ck < LOCAL_HEADS * DQ)
+    v_mask = (t < rows) & (cv < LOCAL_HEADS * DV)
+    k = tl.load(k_ptr + t * k_stride + rank * LOCAL_HEADS * DQ + ck, mask=k_mask)
+    v = tl.load(v_ptr + t * v_stride + rank * LOCAL_HEADS * DV + cv, mask=v_mask)
+    if HAS_V_SCALE:
+        v = (v.to(tl.float32) * v_scale).to(v.dtype)
+    send = send_ptr + (rank * rows + t) * (LOCAL_HEADS * (DQ + DV))
+    tl.store(send + ck, k, mask=k_mask)
+    tl.store(send + LOCAL_HEADS * DQ + cv, v, mask=v_mask)
+    in_tail = t >= tail_start
+    tail = tail_ptr + (t - tail_start) * (HEADS * (DQ + DV))
+    tl.store(tail + rank * LOCAL_HEADS * DQ + ck, k, mask=k_mask & in_tail)
+    tl.store(tail + HEADS * DQ + rank * LOCAL_HEADS * DV + cv, v, mask=v_mask & in_tail)
+
+
+@triton.jit
+def _mimo_sp_swa_pages_kernel(
+    kv_src_ptr,
+    cached_ptr,
+    tails_ptr,
+    k_ptr,
+    v_ptr,
+    k_pages_ptr,
+    v_pages_ptr,
+    k_stride,
+    v_stride,
+    v_scale,
+    cache_rows,
+    own_base,
+    own_end,
+    HEADS: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    DQ: tl.constexpr,
+    DV: tl.constexpr,
+    PAGE: tl.constexpr,
+    X: tl.constexpr,
+    BLOCK_DQ: tl.constexpr,
+    HAS_V_SCALE: tl.constexpr,
+):
+    """One SHUFFLE-5D page of one KV head from the kv_src rows of [cached, tails, own,
+    zero]: cached is (attn_tp, cache_rows, [K | V] of the rank's heads), tails is
+    (rows, [K | V] of all heads), own rows are read from K and V (V scaled here)."""
+    page = tl.program_id(0)
+    head = tl.program_id(1)
+    i = tl.arange(0, PAGE)[:, None]
+    dk = tl.arange(0, BLOCK_DQ)[None, :]
+    dv = tl.arange(0, DV)[None, :]
+    src = tl.load(kv_src_ptr + page * PAGE + i)
+    in_cache = src < cache_rows
+    in_tail = (src >= cache_rows) & (src < own_base)
+    in_own = (src >= own_base) & (src < own_end)
+    cached = cached_ptr + ((head // LOCAL_HEADS) * cache_rows + src) * LOCAL_HEADS * (
+        DQ + DV
+    )
+    tails = tails_ptr + (src - cache_rows) * HEADS * (DQ + DV)
+    own = src - own_base
+    k_mask = dk < DQ
+    # Zero for the padding row (zero_row).
+    k = tl.load(
+        k_ptr + own * k_stride + head * DQ + dk, mask=in_own & k_mask, other=0.0
+    )
+    v = tl.load(v_ptr + own * v_stride + head * DV + dv, mask=in_own, other=0.0)
+    if HAS_V_SCALE:
+        v = (v.to(tl.float32) * v_scale).to(v.dtype)
+    head_off = head % LOCAL_HEADS
+    k = tl.where(
+        in_cache, tl.load(cached + head_off * DQ + dk, mask=in_cache & k_mask), k
+    )
+    v = tl.where(
+        in_cache,
+        tl.load(cached + LOCAL_HEADS * DQ + head_off * DV + dv, mask=in_cache),
+        v,
+    )
+    k = tl.where(in_tail, tl.load(tails + head * DQ + dk, mask=in_tail & k_mask), k)
+    v = tl.where(in_tail, tl.load(tails + HEADS * DQ + head * DV + dv, mask=in_tail), v)
+    base = page * HEADS + head
+    tl.store(
+        k_pages_ptr + base * DQ * PAGE + dk // X * PAGE * X + i * X + dk % X,
+        k,
+        mask=k_mask,
+    )
+    tl.store(v_pages_ptr + base * DV * PAGE + i // X * DV * X + dv * X + i % X, v)
+
+
+@functools.lru_cache(maxsize=None)
+def _mimo_unit_scale(device: torch.device) -> torch.Tensor:
+    return torch.ones(1, dtype=torch.float32, device=device)
 
 
 def _mimo_needs_v_padding(
@@ -1101,6 +1217,7 @@ class MiMoV2Attention(nn.Module):
         """SWA prefill on this rank's token slice with all heads (SGLANG_ENABLE_DPA_SP)."""
         from aiter.ops.flydsl import flydsl_paged_attention_swa_bf16
 
+        from sglang.srt.layers.attention.utils import gather_shuffle_5d_to_linear
         from sglang.srt.mem_cache.memory_pool import KVWriteLoc
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -1117,21 +1234,36 @@ class MiMoV2Attention(nn.Module):
         qkv, _ = self.qkv_proj_full(hidden_states)
         q, k, v = qkv.split([heads * dq, kv_heads * dq, kv_heads * dv], dim=-1)
         q, k = self.rotary_emb(positions[rank * rows : (rank + 1) * rows], q, k)
-        if self.v_scale is not None:
-            v = v * self.v_scale
-        own = torch.cat(
-            [k.reshape(rows, kv_heads, dq), v.reshape(rows, kv_heads, dv)], dim=-1
-        )
+        k = k.reshape(rows, kv_heads * dq)
+        v_scale = 1.0 if self.v_scale is None else self.v_scale
+        row = local_kv_heads * (dq + dv)
 
-        # This rank's KV heads for every token of the DP group -> the head-sharded cache.
-        send = (
-            own.view(rows, attn_tp, local_kv_heads, dq + dv)
-            .transpose(0, 1)
-            .contiguous()
+        # This rank's KV heads for every token of the DP group -> the head-sharded cache;
+        # the last keys of every slice are kept for the windows of the next slices.
+        send = q.new_empty((attn_tp, rows, row))
+        tail = q.new_empty((meta.tail_rows, kv_heads * (dq + dv)))
+        _mimo_sp_swa_send_kernel[(triton.cdiv(rows, 16), attn_tp)](
+            k,
+            v,
+            send,
+            tail,
+            k.stride(0),
+            v.stride(0),
+            v_scale,
+            rows,
+            rows - meta.tail_rows,
+            HEADS=kv_heads,
+            LOCAL_HEADS=local_kv_heads,
+            DQ=dq,
+            DV=dv,
+            BLOCK_T=16,
+            BLOCK_K=triton.next_power_of_2(local_kv_heads * dq),
+            BLOCK_V=triton.next_power_of_2(local_kv_heads * dv),
+            HAS_V_SCALE=self.v_scale is not None,
         )
         received = torch.empty_like(send)
         group.all_to_all_single(received, send)
-        received = received.view(attn_tp * rows, local_kv_heads, dq + dv)
+        received = received.view(attn_tp * rows, row)
         backend = get_attn_backend()
         pool = backend.token_to_kv_pool
         pool.set_kv_buffer(
@@ -1140,52 +1272,67 @@ class MiMoV2Attention(nn.Module):
                 forward_batch.out_cache_loc,
                 getattr(backend.forward_metadata, "swa_out_cache_loc", None),
             ),
-            received[..., :dq].contiguous(),
-            received[..., dq:].contiguous(),
+            received[:, : local_kv_heads * dq].view(-1, local_kv_heads, dq),
+            received[:, local_kv_heads * dq :].view(-1, local_kv_heads, dv),
             None,
             None,
         )
 
-        # Window halos: the last keys of every slice, and cached keys left of each chunk.
-        sources = []
+        # Window halos: cached keys left of each chunk, and the tails of earlier slices.
+        cached = tail  # not read without cached rows
         if meta.cache_rows:
+            cached = q.new_empty((meta.cache_rows, row))
             k_cache = pool.get_key_buffer(self.attn.layer_id)
-            v_cache = pool.get_value_buffer(self.attn.layer_id)
-            page, offset = meta.cache_page, meta.cache_offset
-            cached = torch.cat(
-                [
-                    k_cache[page, :, :, offset, :].reshape(-1, local_kv_heads, dq),
-                    v_cache[page, :, offset // 8, :, offset % 8],
-                ],
-                dim=-1,
+            gather_shuffle_5d_to_linear[(meta.cache_rows, 1)](
+                k_cache,
+                pool.get_value_buffer(self.attn.layer_id),
+                cached,
+                cached[:, local_kv_heads * dq :],
+                meta.cache_loc,
+                row,
+                row,
+                local_kv_heads,
+                dq,
+                dv,
+                _SP_SWA_PAGE,
+                X=k_cache.shape[-1],
+                HEAD_BLOCK=triton.next_power_of_2(local_kv_heads),
+                KEY_BLOCK_D=triton.next_power_of_2(dq),
+                VALUE_BLOCK_D=triton.next_power_of_2(dv),
             )
-            cached = _mimo_attn_tp_gather(cached).view(
-                attn_tp, meta.cache_rows, local_kv_heads, dq + dv
-            )
-            sources.append(
-                cached.transpose(0, 1).reshape(meta.cache_rows, kv_heads, dq + dv)
-            )
-        sources.append(_mimo_attn_tp_gather(own[rows - meta.tail_rows :].contiguous()))
-        sources.append(own)
-        sources.append(own.new_zeros((1, kv_heads, dq + dv)))
-        keys = torch.cat(sources)[meta.kv_src]
-        pages = keys.shape[0] // _SP_SWA_PAGE
-        k_pages = (
-            keys[..., :dq]
-            .reshape(pages, _SP_SWA_PAGE, kv_heads, dq // 8, 8)
-            .permute(0, 2, 3, 1, 4)
-            .contiguous()
-        )
-        v_pages = (
-            keys[..., dq:]
-            .reshape(pages, _SP_SWA_PAGE // 8, 8, kv_heads, dv)
-            .permute(0, 3, 1, 4, 2)
-            .contiguous()
+            cached = _mimo_attn_tp_gather(cached)
+        tails = _mimo_attn_tp_gather(tail)
+        own_base = meta.cache_rows + attn_tp * meta.tail_rows
+        pages = meta.kv_src.shape[0] // _SP_SWA_PAGE
+        k_pages = q.new_empty((pages, kv_heads, dq // 8, _SP_SWA_PAGE, 8))
+        v_pages = q.new_empty((pages, kv_heads, _SP_SWA_PAGE // 8, dv, 8))
+        _mimo_sp_swa_pages_kernel[(pages, kv_heads)](
+            meta.kv_src,
+            cached,
+            tails,
+            k,
+            v,
+            k_pages,
+            v_pages,
+            k.stride(0),
+            v.stride(0),
+            v_scale,
+            meta.cache_rows,
+            own_base,
+            own_base + rows,
+            HEADS=kv_heads,
+            LOCAL_HEADS=local_kv_heads,
+            DQ=dq,
+            DV=dv,
+            PAGE=_SP_SWA_PAGE,
+            X=8,
+            BLOCK_DQ=triton.next_power_of_2(dq),
+            HAS_V_SCALE=self.v_scale is not None,
         )
 
         out = (q.new_zeros if meta.q_rows < rows else q.new_empty)((rows, heads, dv))
         if meta.q_rows:
-            unit = torch.ones(1, dtype=torch.float32, device=q.device)
+            unit = _mimo_unit_scale(q.device)
             flydsl_paged_attention_swa_bf16(
                 q.view(rows, heads, dq)[: meta.q_rows],
                 k_pages,

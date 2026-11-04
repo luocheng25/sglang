@@ -83,6 +83,7 @@ from sglang.srt.layers.quantization.pyhip_fp8_blockscale_gemm import (
     _stage_end,
     _uniform,
     _wait,
+    flydsl_disk_cache,
 )
 
 logger = logging.getLogger(__name__)
@@ -2029,7 +2030,8 @@ def _run(key, launcher, *args):
     compiled = _compiled.get(key)
     if compiled is None:
         # flyc.compile also launches this first call.
-        _compiled[key] = flyc.compile(launcher, *args)
+        with flydsl_disk_cache(__file__):
+            _compiled[key] = flyc.compile(launcher, *args)
     else:
         compiled(*args)
 

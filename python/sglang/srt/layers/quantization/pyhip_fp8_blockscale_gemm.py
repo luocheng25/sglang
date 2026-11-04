@@ -51,6 +51,11 @@ most half the CUs is split K-wise into S >= 4 pieces that fill the round; each p
 FP32 partial and a second kernel sums the S partials in piece order (deterministic) to BF16.
 """
 
+import contextlib
+import functools
+import hashlib
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -468,7 +473,7 @@ def _body(
     lane = tid & 63
     q = wave & 3
     wm, wn = (q >> 1) + 2 * GROUP, q & 1
-    r, h = lane & 31, lane >> 5
+    h = lane >> 5
 
     m_rows = _min(fx.Int32(BM), M - tile_m * BM)
     n_rows = _min(fx.Int32(BN), N - tile_n * BN)
@@ -953,6 +958,46 @@ _partials = {}
 PIECE_BYTES = 262144
 
 
+@functools.lru_cache(maxsize=None)
+def _source_digest(files):
+    digest = hashlib.sha256()
+    for path in files:
+        with open(path, "rb") as f:
+            digest.update(f.read())
+    return digest.hexdigest()[:16]
+
+
+@contextlib.contextmanager
+def flydsl_disk_cache(*sources):
+    """FlyDSL's disk cache on while compiling, in a directory keyed by this file and `sources`.
+
+    A kernel variant takes up to 7 s to compile and every server process compiles its own. sglang's
+    FlyDSL attention turns the cache off process-wide, and FlyDSL's cache key does not cover module
+    constants, hence the per-source directory.
+    """
+    names = ("FLYDSL_RUNTIME_ENABLE_CACHE", "FLYDSL_RUNTIME_CACHE_DIR")
+    saved = {name: os.environ.get(name) for name in names}
+    root = saved[names[1]] or os.path.join(os.path.expanduser("~"), ".flydsl", "cache")
+    path = os.path.join(root, "sglang-" + _source_digest((__file__,) + sources))
+    try:
+        os.makedirs(path, exist_ok=True)
+        writable = os.access(path, os.W_OK)
+    except OSError:
+        writable = False
+    if not writable:
+        yield
+        return
+    os.environ.update({names[0]: "1", names[1]: path})
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _plan(tiles, kb, cus):
     """(full, tail, S): whole rounds of tiles, then `tail` tiles split into S K-pieces filling the last round.
 
@@ -1045,7 +1090,8 @@ def gemm_a8w8_blockscale_942(x, w, x_scale_t, w_scale, out=None, w_preshuffled=N
     compiled = _compiled.get(key)
     if compiled is None:
         # flyc.compile also launches this first call.
-        _compiled[key] = flyc.compile(_launch, *args)
+        with flydsl_disk_cache():
+            _compiled[key] = flyc.compile(_launch, *args)
     else:
         compiled(*args)
     if tail:
@@ -1053,7 +1099,8 @@ def gemm_a8w8_blockscale_942(x, w, x_scale_t, w_scale, out=None, w_preshuffled=N
         key = ("reduce", device, n, s)
         compiled = _compiled.get(key)
         if compiled is None:
-            _compiled[key] = flyc.compile(_launch_reduce, *args)
+            with flydsl_disk_cache():
+                _compiled[key] = flyc.compile(_launch_reduce, *args)
         else:
             compiled(*args)
     return out

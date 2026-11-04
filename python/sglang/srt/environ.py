@@ -518,32 +518,16 @@ class Envs:
     SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
     # Optional gfx942 BF16 MiMo full prefill, behind the existing FlyPA guards.
     SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
-    # PyHIP checkout whose src/pyhip extends the installed pyhip (AITER needs the installed one).
-    SGLANG_PYHIP_ROOT = EnvStr(None)
-    # gfx942 FP8 block-scale linear via PyHIP's FlyDSL 256x256 kernel on the CK bpreshuffle
-    # path, for at least SGLANG_PYHIP_FP8_GEMM_MIN_M tokens (CK below).
+    # gfx942 FP8 block-scale linears on the CK bpreshuffle path (>= 2048 tokens) via the
+    # FlyDSL kernel ported from PyHIP (layers/quantization/pyhip_fp8_blockscale_gemm.py).
     SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
-    SGLANG_PYHIP_FP8_GEMM_MIN_M = EnvInt(2048)
-    # gfx942 FP8 block-scale MoE on the aiter runner via PyHIP's FlyDSL two-stage kernels, for calls
-    # with at least SGLANG_PYHIP_FP8_MOE_MIN_TOKENS tokens and >= 512 intermediate columns per rank.
-    SGLANG_USE_PYHIP_FP8_MOE = EnvBool(False)
-    SGLANG_PYHIP_FP8_MOE_MIN_TOKENS = EnvInt(8192)
-    # MiMo DP attention with TP MoE (moe_a2a_backend=none): keep the residual stream
-    # token-scattered over the attention-TP ranks. Per MoE layer this replaces the two BF16
-    # all-reduces by an attention-TP reduce-scatter, an all-gather of the FP8 MoE input
-    # (+ 1x128 scales, top-k) and a reduce-scatter of the MoE output over the TP group.
-    SGLANG_DPA_SP_MOE = EnvBool(False)
-    # Forward passes with fewer global tokens (decode, CUDA graphs) keep the all-reduce path.
-    SGLANG_DPA_SP_MOE_MIN_TOKENS = EnvInt(2048)
-    # With SGLANG_DPA_SP_MOE: all-to-all the attention output (half the bytes of the
-    # attention-TP reduce-scatter) and run o_proj with the full weight on the local token
-    # slice; one FP32-accumulated GEMM instead of BF16 partial sums.
-    SGLANG_DPA_SP_OPROJ = EnvBool(False)
-    # With SGLANG_DPA_SP_MOE, MiMo SWA layers in prefill: QKV, sliding-window attention (all
-    # heads) and o_proj on the local token slice; only K/V (to the head-sharded cache) and
-    # window halos cross the attention-TP group instead of the hidden-state all-gather and
-    # the o_proj reduction.
-    SGLANG_DPA_SP_SWA = EnvBool(False)
+    # MiMo DP attention with TP MoE (moe_a2a_backend=none), forward passes with >= 2048
+    # global tokens: the residual stays token-scattered over the attention-TP ranks. MoE
+    # all-gathers its FP8 input and reduce-scatters its output over the TP group;
+    # full-attention layers all-to-all the attention output into a full-weight o_proj;
+    # SWA layers in extend batches run QKV, attention (all heads) and o_proj on the token
+    # shard, exchanging only K/V and window halos. Decode and CUDA graphs are unchanged.
+    SGLANG_ENABLE_DPA_SP = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

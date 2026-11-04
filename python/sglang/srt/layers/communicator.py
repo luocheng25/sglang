@@ -420,9 +420,9 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
     is_next_layer_sparse: Optional[bool]
-    # The model's MoE handles token-scattered input itself (SGLANG_DPA_SP_MOE).
+    # The model's MoE handles token-scattered input itself (SGLANG_ENABLE_DPA_SP).
     sp_tp_moe: bool = False
-    # Attention runs on the token shard with all heads (MiMo SGLANG_DPA_SP_SWA).
+    # Attention runs on the token shard with all heads (MiMo SWA under SGLANG_ENABLE_DPA_SP).
     sp_attn: bool = False
 
     def previous_layer(self):
@@ -849,7 +849,8 @@ class LayerCommunicator:
         quant_format: str = "",
     ):
         """prepare_mlp when attention already returned this rank's reduced token slice
-        (MiMo SGLANG_DPA_SP_OPROJ): only the residual add and post-attention norm remain."""
+        (MiMo SGLANG_ENABLE_DPA_SP): only the residual add and post-attention norm remain.
+        """
         assert self.layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         assert self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED
         if self.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL:

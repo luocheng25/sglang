@@ -135,63 +135,6 @@ def _aiter_fused_moe_supports_transposed_a1_scale() -> bool:
 
 
 @functools.cache
-def _load_pyhip_fp8_moe():
-    import importlib
-    import os
-
-    import pyhip
-
-    from sglang.srt.environ import envs
-
-    root = envs.SGLANG_PYHIP_ROOT.get()
-    if root:
-        source = os.path.join(root, "src", "pyhip")
-        if source not in pyhip.__path__:
-            pyhip.__path__.insert(0, source)
-    module = importlib.import_module("pyhip.ops.moe.flydsl.moe_fp8_blockscale_942")
-    logger.info("Using PyHIP %s for gfx942 FP8 block-scale MoE", module.__file__)
-    return module.fused_moe_fp8_blockscale_942
-
-
-def _use_pyhip_fp8_moe(
-    runner_input: AiterRunnerInput,
-    quant_info: AiterMoeQuantInfo,
-    config: MoeRunnerConfig,
-) -> bool:
-    from sglang.srt.environ import envs
-    from sglang.srt.utils import is_gfx942_supported
-
-    if not envs.SGLANG_USE_PYHIP_FP8_MOE.get():
-        return False
-    x = runner_input.hidden_states
-    w13 = quant_info.w13_weight
-    return (
-        quant_info.quant_type == AiterQuantType.PER_128X128
-        and runner_input.quant_type == AiterQuantType.PER_128X128
-        and config.activation == "silu"
-        and not config.no_combine
-        and quant_info.b13 is None
-        and quant_info.b2 is None
-        and quant_info.a2_scale is None
-        and quant_info.swiglu_limit == 0
-        and not quant_info.is_fp4_experts
-        and not quant_info.doweight_stage1
-        and quant_info.hidden_pad == 0
-        and quant_info.intermediate_pad == 0
-        and runner_input.num_local_tokens is None
-        and runner_input.output_dtype in (None, torch.bfloat16)
-        and getattr(w13, "is_shuffled", False)
-        # Measured: at 256 columns per rank (MiMo TP8) the K=256 down GEMM and the
-        # top-k reduction are memory-bound and AITER's one-stage kernel is as fast.
-        and w13.shape[1] // 2 >= 512
-        and x.shape[0] >= envs.SGLANG_PYHIP_FP8_MOE_MIN_TOKENS.get()
-        and (x.dtype == torch.bfloat16 or runner_input.a1_scale_is_transposed)
-        and is_gfx942_supported()
-        and not torch.cuda.is_current_stream_capturing()
-    )
-
-
-@functools.cache
 def _aiter_fused_moe_supports_ep_route_convention() -> bool:
     from aiter.fused_moe import fused_moe
 
@@ -264,20 +207,6 @@ class AiterRunnerCore(MoeRunnerCore):
             if runner_input.a1_scale is not None
             else quant_info.a13_scale
         )
-
-        if _use_pyhip_fp8_moe(runner_input, quant_info, self.config):
-            output = _load_pyhip_fp8_moe()(
-                runner_input.hidden_states,
-                quant_info.w13_weight,
-                quant_info.w2_weight,
-                runner_input.topk_weights,
-                runner_input.topk_ids,
-                quant_info.w13_scale,
-                quant_info.w2_scale,
-                a1_scale=a1_scale,
-                expert_mask=quant_info.expert_mask,
-            )
-            return AiterRunnerOutput(hidden_states=output)
 
         extra: dict = {}
         if quant_info.fused_moe_kwargs:

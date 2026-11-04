@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import importlib
 import logging
-import os
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -87,7 +85,8 @@ _use_pyhip_fp8_blockscale_gemm = (
     and envs.SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM.get()
     and is_gfx942_supported()
 )
-_pyhip_fp8_gemm_min_m = envs.SGLANG_PYHIP_FP8_GEMM_MIN_M.get()
+# Decode and small extends stay on CK.
+_PYHIP_FP8_GEMM_MIN_M = 2048
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -817,18 +816,12 @@ def _unpack_ue8m0_scale_for_triton(
 
 @lru_cache(maxsize=1)
 def _load_pyhip_fp8_blockscale_gemm():
-    import pyhip
-
-    root = envs.SGLANG_PYHIP_ROOT.get()
-    if root:
-        source = os.path.join(root, "src", "pyhip")
-        if source not in pyhip.__path__:
-            pyhip.__path__.insert(0, source)
-    module = importlib.import_module(
-        "pyhip.ops.gemm.flydsl.gemm_fp8_blockscale_8w_942"
+    from sglang.srt.layers.quantization.pyhip_fp8_blockscale_gemm import (
+        gemm_a8w8_blockscale_942,
     )
-    logger.info("Using PyHIP %s for gfx942 FP8 block-scale linears", module.__file__)
-    return module.gemm_a8w8_blockscale_942
+
+    logger.info("Using the PyHIP FlyDSL kernel for gfx942 FP8 block-scale linears")
+    return gemm_a8w8_blockscale_942
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -888,7 +881,7 @@ def aiter_w8a8_block_fp8_linear(
     if (
         use_bpreshuffle
         and _use_pyhip_fp8_blockscale_gemm
-        and m >= _pyhip_fp8_gemm_min_m
+        and m >= _PYHIP_FP8_GEMM_MIN_M
         and n % 32 == 0
         and k % 128 == 0
         and out_dtype == torch.bfloat16

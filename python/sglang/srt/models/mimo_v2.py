@@ -1304,8 +1304,11 @@ class MiMoV2Attention(nn.Module):
         tails = _mimo_attn_tp_gather(tail)
         own_base = meta.cache_rows + attn_tp * meta.tail_rows
         pages = meta.kv_src.shape[0] // _SP_SWA_PAGE
-        k_pages = q.new_empty((pages, kv_heads, dq // 8, _SP_SWA_PAGE, 8))
-        v_pages = q.new_empty((pages, kv_heads, _SP_SWA_PAGE // 8, dv, 8))
+        # The FlyDSL SWA kernel compiles once per K.shape[0] (an unused constexpr), about
+        # 1.6 s each: power-of-two page buffers keep that to a few variants.
+        alloc = max(128, 1 << max(pages - 1, 0).bit_length())
+        k_pages = q.new_empty((alloc, kv_heads, dq // 8, _SP_SWA_PAGE, 8))
+        v_pages = q.new_empty((alloc, kv_heads, _SP_SWA_PAGE // 8, dv, 8))
         _mimo_sp_swa_pages_kernel[(pages, kv_heads)](
             meta.kv_src,
             cached,

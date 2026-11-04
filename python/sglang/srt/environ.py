@@ -518,6 +518,19 @@ class Envs:
     SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
     # Optional gfx942 BF16 MiMo full prefill, behind the existing FlyPA guards.
     SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
+    # PyHIP checkout whose src/pyhip extends the installed pyhip (AITER needs the installed one).
+    SGLANG_PYHIP_ROOT = EnvStr(None)
+    # gfx942 FP8 block-scale linear via PyHIP's FlyDSL 256x256 kernel on the CK bpreshuffle
+    # path, for at least SGLANG_PYHIP_FP8_GEMM_MIN_M tokens (CK below).
+    SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
+    SGLANG_PYHIP_FP8_GEMM_MIN_M = EnvInt(2048)
+    # MiMo DP attention with TP MoE (moe_a2a_backend=none): keep the residual stream
+    # token-scattered over the attention-TP ranks. Per MoE layer this replaces the two BF16
+    # all-reduces by an attention-TP reduce-scatter, an all-gather of the FP8 MoE input
+    # (+ 1x128 scales, top-k) and a reduce-scatter of the MoE output over the TP group.
+    SGLANG_DPA_SP_MOE = EnvBool(False)
+    # Forward passes with fewer global tokens (decode, CUDA graphs) keep the all-reduce path.
+    SGLANG_DPA_SP_MOE_MIN_TOKENS = EnvInt(2048)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

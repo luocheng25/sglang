@@ -420,6 +420,8 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
     is_next_layer_sparse: Optional[bool]
+    # The model's MoE handles token-scattered input itself (SGLANG_DPA_SP_MOE).
+    sp_tp_moe: bool = False
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -429,6 +431,7 @@ class _LayerModeComputationContext:
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
             is_next_layer_sparse=self.is_layer_sparse,
+            sp_tp_moe=self.sp_tp_moe,
         )
 
 
@@ -465,6 +468,7 @@ class LayerScatterModes:
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or context.sp_tp_moe
             ):
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.

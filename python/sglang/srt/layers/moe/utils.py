@@ -428,6 +428,19 @@ def should_use_dp_reduce_scatterv():
     )
 
 
+def should_use_dpa_sp_moe():
+    """Sequence-parallel TP MoE under DP attention (SGLANG_DPA_SP_MOE, models that opt in):
+    MoE layers run on attention-TP token shards; the MoE all-gathers its FP8 input over the
+    TP group and reduce-scatters its output instead of the dp_gather/all-reduce pair."""
+    return (
+        envs.SGLANG_DPA_SP_MOE.get()
+        and is_dp_attention_enabled()
+        and get_moe_a2a_backend().is_none()
+        and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        and get_moe_expert_parallel_world_size() == 1
+    )
+
+
 def should_skip_post_experts_all_reduce(
     *,
     is_tp_path: bool,

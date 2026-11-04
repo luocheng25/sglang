@@ -524,6 +524,10 @@ class Envs:
     # path, for at least SGLANG_PYHIP_FP8_GEMM_MIN_M tokens (CK below).
     SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
     SGLANG_PYHIP_FP8_GEMM_MIN_M = EnvInt(2048)
+    # gfx942 FP8 block-scale MoE on the aiter runner via PyHIP's FlyDSL two-stage kernels, for calls
+    # with at least SGLANG_PYHIP_FP8_MOE_MIN_TOKENS tokens and >= 512 intermediate columns per rank.
+    SGLANG_USE_PYHIP_FP8_MOE = EnvBool(False)
+    SGLANG_PYHIP_FP8_MOE_MIN_TOKENS = EnvInt(8192)
     # MiMo DP attention with TP MoE (moe_a2a_backend=none): keep the residual stream
     # token-scattered over the attention-TP ranks. Per MoE layer this replaces the two BF16
     # all-reduces by an attention-TP reduce-scatter, an all-gather of the FP8 MoE input
@@ -531,6 +535,15 @@ class Envs:
     SGLANG_DPA_SP_MOE = EnvBool(False)
     # Forward passes with fewer global tokens (decode, CUDA graphs) keep the all-reduce path.
     SGLANG_DPA_SP_MOE_MIN_TOKENS = EnvInt(2048)
+    # With SGLANG_DPA_SP_MOE: all-to-all the attention output (half the bytes of the
+    # attention-TP reduce-scatter) and run o_proj with the full weight on the local token
+    # slice; one FP32-accumulated GEMM instead of BF16 partial sums.
+    SGLANG_DPA_SP_OPROJ = EnvBool(False)
+    # With SGLANG_DPA_SP_MOE, MiMo SWA layers in prefill: QKV, sliding-window attention (all
+    # heads) and o_proj on the local token slice; only K/V (to the head-sharded cache) and
+    # window halos cross the attention-TP group instead of the hidden-state all-gather and
+    # the o_proj reduction.
+    SGLANG_DPA_SP_SWA = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -938,7 +951,8 @@ class Envs:
     # lookup at the cost of replicated embedding weights). Drives both the
     # target and every draft that shares its embedding (see
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
-    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
+    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts
+    # and MiMo-V2 (+ MTP; DFlash uses the target embedding module).
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)

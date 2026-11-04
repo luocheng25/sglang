@@ -422,6 +422,8 @@ class _LayerModeComputationContext:
     is_next_layer_sparse: Optional[bool]
     # The model's MoE handles token-scattered input itself (SGLANG_DPA_SP_MOE).
     sp_tp_moe: bool = False
+    # Attention runs on the token shard with all heads (MiMo SGLANG_DPA_SP_SWA).
+    sp_attn: bool = False
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -449,7 +451,9 @@ class LayerScatterModes:
         context = _LayerModeComputationContext(**kwargs)
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
-            attn_mode=ScatterMode.TP_ATTN_FULL,
+            attn_mode=(
+                ScatterMode.SCATTERED if context.sp_attn else ScatterMode.TP_ATTN_FULL
+            ),
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
@@ -590,7 +594,15 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            gathered_last_layer_output = self._communicate_simple_fn(
+            capture_fn = self._communicate_simple_fn
+            if (
+                self.layer_scatter_modes.attn_mode == ScatterMode.SCATTERED
+                and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and self._context.attn_tp_size > 1
+            ):
+                # Captures stay attention-TP gathered, as with TP attention.
+                capture_fn = CommunicateSimpleFn._scattered_to_tp_attn_full
+            gathered_last_layer_output = capture_fn(
                 hidden_states=residual,
                 forward_batch=forward_batch,
                 context=self._context,
@@ -829,6 +841,24 @@ class LayerCommunicator:
             layernorm=layernorm,
             context=self._context,
         )
+
+    def prepare_mlp_from_scattered_attn(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        quant_format: str = "",
+    ):
+        """prepare_mlp when attention already returned this rank's reduced token slice
+        (MiMo SGLANG_DPA_SP_OPROJ): only the residual add and post-attention norm remain."""
+        assert self.layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        assert self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED
+        if self.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL:
+            residual = residual.tensor_split(self._context.attn_tp_size)[
+                self._context.attn_tp_rank
+            ]
+        if hidden_states.shape[0] == 0:
+            return hidden_states, residual
+        return self._get_prepare_mlp_layernorm(quant_format)(hidden_states, residual)
 
     def _get_prepare_mlp_layernorm(self, quant_format: str):
         layernorm = self.post_attention_layernorm
@@ -1091,6 +1121,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
+            return CommunicateWithAllReduceAndLayerNormFn._simple
+
+        if all(
+            mode == ScatterMode.SCATTERED
+            for mode in (
+                hidden_states_input_mode,
+                residual_input_mode,
+                hidden_states_output_mode,
+                residual_output_mode,
+            )
+        ):
+            # Attention on the token shard already produced reduced rows.
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (

@@ -12,7 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
+import itertools
 import logging
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -67,12 +70,14 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -193,6 +198,164 @@ def _mimo_sp_moe_gather_scales(scale: torch.Tensor, sizes: List[int]) -> torch.T
     merged = merged.view(total, groups)
     merged._aiter_moe_scale_is_transposed = True
     return merged
+
+
+def _mimo_sp_o_proj_enabled() -> bool:
+    return (
+        (envs.SGLANG_DPA_SP_OPROJ.get() or envs.SGLANG_DPA_SP_SWA.get())
+        and should_use_dpa_sp_moe()
+        and get_attention_tp_size() > 1
+    )
+
+
+def _mimo_sp_swa_enabled() -> bool:
+    return (
+        envs.SGLANG_DPA_SP_SWA.get()
+        and should_use_dpa_sp_moe()
+        and get_attention_tp_size() > 1
+    )
+
+
+def _mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method):
+    """o_proj for this rank's token slice (SGLANG_DPA_SP_OPROJ): all-to-all over attention TP
+    gives every rank its token slice of all head groups, then one GEMM with the full weight."""
+    attn_tp = get_attention_tp_size()
+    rows = attn_output.shape[0] // attn_tp
+    assert rows * attn_tp == attn_output.shape[0]
+    received = torch.empty_like(attn_output)
+    get_attention_tp_group().all_to_all_single(received, attn_output.contiguous())
+    x = received.view(attn_tp, rows, -1).transpose(0, 1).reshape(rows, -1)
+    return quant_method.apply(SimpleNamespace(weight=weight), x)
+
+
+_SP_SWA_PAGE = 64
+
+
+def _mimo_attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
+    """All-gather along dim 0 over attention TP (1-byte dtypes as bytes: no FP8 collectives)."""
+    tensor = tensor.contiguous()
+    data = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
+    out = data.new_empty((get_attention_tp_size() * data.shape[0], *data.shape[1:]))
+    get_attention_tp_group().all_gather_into_tensor(out, data)
+    return out.view(tensor.dtype)
+
+
+@dataclass
+class _MimoSpSwaMetadata:
+    """Per-forward layout of one rank's sliding-window attention under SGLANG_DPA_SP_SWA.
+
+    Keys of every request segment in this rank's token slice are packed into page-64
+    SHUFFLE-5D pages: cached keys left of the chunk, keys from earlier slices, then the
+    slice's own keys. kv_src indexes rows of cat([cached, tails, own, zero])."""
+
+    key: Tuple[int, int]
+    q_rows: int
+    tail_rows: int
+    cache_rows: int
+    cache_page: Optional[torch.Tensor]
+    cache_offset: Optional[torch.Tensor]
+    kv_src: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    kv_indptr: torch.Tensor
+    page_ids: torch.Tensor
+    last_page_lens: torch.Tensor
+    max_q: int
+    max_kv: int
+
+
+def _mimo_sp_swa_metadata(
+    forward_batch: ForwardBatch, window: int, rows: int
+) -> _MimoSpSwaMetadata:
+    key = (window, rows)
+    meta = getattr(forward_batch, "_mimo_sp_swa_metadata", None)
+    if meta is not None and meta.key == key:
+        return meta
+    attn_tp, rank = get_attention_tp_size(), get_attention_tp_rank()
+    lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+    prefixes = [int(x) for x in forward_batch.extend_prefix_lens_cpu]
+    tail = min(window, rows)
+    cache_counts = [min(p, window) if n > 0 else 0 for p, n in zip(prefixes, lens)]
+    cache_ends = list(itertools.accumulate(cache_counts))
+    cache_rows = cache_ends[-1] if cache_ends else 0
+    tail_base = cache_rows
+    own_base = tail_base + attn_tp * tail
+    zero_row = own_base + rows
+    s0, s1 = rank * rows, (rank + 1) * rows
+    kv_src, cu_q, kv_indptr, last_page = [], [0], [0], []
+    max_q = max_kv = 0
+    start = 0
+    for i, (length, prefix) in enumerate(zip(lens, prefixes)):
+        a, b = start, start + length
+        start = b
+        qa, qb = max(a, s0), min(b, s1)
+        if qa >= qb:
+            continue
+        from_batch = min(qa - a, window)
+        from_cache = min(prefix, window - from_batch)
+        parts = []
+        if from_cache:
+            parts.append(torch.arange(cache_ends[i] - from_cache, cache_ends[i]))
+        if from_batch:
+            t = torch.arange(qa - from_batch, qa)
+            sl = t // rows
+            parts.append(tail_base + sl * tail + (t - sl * rows) - (rows - tail))
+        parts.append(torch.arange(own_base + qa - s0, own_base + qb - s0))
+        idx = torch.cat(parts)
+        keys = idx.numel()
+        pages = -(-keys // _SP_SWA_PAGE)
+        pad = pages * _SP_SWA_PAGE - keys
+        if pad:
+            idx = torch.cat([idx, torch.full((pad,), zero_row, dtype=idx.dtype)])
+        kv_src.append(idx)
+        cu_q.append(cu_q[-1] + qb - qa)
+        kv_indptr.append(kv_indptr[-1] + pages)
+        last_page.append(keys - _SP_SWA_PAGE * (pages - 1))
+        max_q, max_kv = max(max_q, qb - qa), max(max_kv, keys)
+
+    device = forward_batch.positions.device
+    cache_page = cache_offset = None
+    if cache_rows:
+        from sglang.srt.model_executor.forward_context import (
+            get_req_to_token_pool,
+            get_token_to_kv_pool,
+        )
+
+        req_rows = torch.cat(
+            [torch.full((c,), i) for i, c in enumerate(cache_counts) if c]
+        ).to(device)
+        positions = torch.cat(
+            [torch.arange(p - c, p) for p, c in zip(prefixes, cache_counts) if c]
+        ).to(device)
+        full_loc = get_req_to_token_pool().req_to_token[
+            forward_batch.req_pool_indices[req_rows].long(), positions
+        ]
+        swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
+            full_loc.long()
+        ).long()
+        cache_page, cache_offset = swa_loc // _SP_SWA_PAGE, swa_loc % _SP_SWA_PAGE
+
+    def to_device(values, dtype):
+        return torch.tensor(values, dtype=dtype).to(device, non_blocking=True)
+
+    meta = _MimoSpSwaMetadata(
+        key=key,
+        q_rows=cu_q[-1],
+        tail_rows=tail,
+        cache_rows=cache_rows,
+        cache_page=cache_page,
+        cache_offset=cache_offset,
+        kv_src=(
+            torch.cat(kv_src) if kv_src else torch.empty(0, dtype=torch.int64)
+        ).to(device, non_blocking=True),
+        cu_seqlens_q=to_device(cu_q, torch.int32),
+        kv_indptr=to_device(kv_indptr, torch.int32),
+        page_ids=torch.arange(kv_indptr[-1], dtype=torch.int32, device=device),
+        last_page_lens=to_device(last_page, torch.int32),
+        max_q=max_q,
+        max_kv=max_kv,
+    )
+    forward_batch._mimo_sp_swa_metadata = meta
+    return meta
 
 
 def _mimo_needs_v_padding(
@@ -784,6 +947,23 @@ class MiMoV2Attention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
+        # SGLANG_DPA_SP_SWA: all-head QKV in [Q | K | V] order, filled from the TP shards
+        # before weight post-processing.
+        self.qkv_proj_full = None
+        if _mimo_sp_swa_enabled() and sliding_window_size > 0:
+            self.qkv_proj_full = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                v_head_size=self.original_v_head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=0,
+                tp_size=1,
+                prefix=add_prefix("qkv_proj_full", prefix),
+                skip_block_quant_check=True,
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -817,6 +997,157 @@ class MiMoV2Attention(nn.Module):
             )
             if attention_sink_bias
             else None
+        )
+        # Full o_proj weight [hidden, heads * v_head_dim] for SGLANG_DPA_SP_OPROJ / _SWA.
+        self.o_proj_full: Optional[torch.Tensor] = None
+        self.attention_sink_full: Optional[torch.Tensor] = None
+
+    def build_sp_weights(self):
+        """Assemble full-head weights from the attention-TP shards (after load_weights)."""
+        if _mimo_sp_o_proj_enabled() and isinstance(
+            self.o_proj.quant_method, UnquantizedLinearMethod
+        ):
+            shard = self.o_proj.weight.data
+            self.o_proj_full = _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
+        if self.qkv_proj_full is None:
+            return
+        if self.attention_sink_bias is not None:
+            self.attention_sink_full = _mimo_attn_tp_gather(self.attention_sink_bias.data)
+        sizes = (self.q_size, self.k_size, self.v_size)
+        full_params = dict(self.qkv_proj_full.named_parameters())
+        for name, shard in self.qkv_proj.named_parameters():
+            full = full_params[name]
+            if full.shape == shard.shape:
+                full.data.copy_(shard.data)
+                continue
+            rows = shard.shape[0]
+            attn_tp = get_attention_tp_size()
+            parts = [rows * size // sum(sizes) for size in sizes]
+            assert (
+                full.shape == (attn_tp * rows, *shard.shape[1:]) and sum(parts) == rows
+            ), name
+            gathered = _mimo_attn_tp_gather(shard.data).view(attn_tp, rows, *shard.shape[1:])
+            # Per-rank [q_r | k_r | v_r] blocks -> [Q | K | V].
+            full.data.copy_(
+                torch.cat(
+                    [
+                        block.reshape(attn_tp * part, *shard.shape[1:])
+                        for block, part in zip(gathered.split(parts, dim=1), parts)
+                    ]
+                )
+            )
+
+    def forward_sp_swa(
+        self,
+        positions: torch.Tensor,
+        hidden_states,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """SWA prefill on this rank's token slice with all heads (SGLANG_DPA_SP_SWA)."""
+        from aiter.ops.flydsl import flydsl_paged_attention_swa_bf16
+
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        attn_tp, rank = get_attention_tp_size(), get_attention_tp_rank()
+        group = get_attention_tp_group()
+        rows = _mimo_hidden_num_tokens(hidden_states)
+        heads, kv_heads = self.total_num_heads, self.total_num_kv_heads
+        dq, dv = self.head_dim, self.original_v_head_dim
+        local_kv_heads = kv_heads // attn_tp
+        # Same window as the attention-TP kernel call (see run_mimo_flypa_swa_prefill).
+        window = self.attn.sliding_window_size - int(self.attn.tp_k_head_num == 2)
+        meta = _mimo_sp_swa_metadata(forward_batch, window, rows)
+
+        qkv, _ = self.qkv_proj_full(hidden_states)
+        q, k, v = qkv.split([heads * dq, kv_heads * dq, kv_heads * dv], dim=-1)
+        q, k = self.rotary_emb(positions[rank * rows : (rank + 1) * rows], q, k)
+        if self.v_scale is not None:
+            v = v * self.v_scale
+        own = torch.cat(
+            [k.reshape(rows, kv_heads, dq), v.reshape(rows, kv_heads, dv)], dim=-1
+        )
+
+        # This rank's KV heads for every token of the DP group -> the head-sharded cache.
+        send = own.view(rows, attn_tp, local_kv_heads, dq + dv).transpose(0, 1).contiguous()
+        received = torch.empty_like(send)
+        group.all_to_all_single(received, send)
+        received = received.view(attn_tp * rows, local_kv_heads, dq + dv)
+        backend = get_attn_backend()
+        pool = backend.token_to_kv_pool
+        pool.set_kv_buffer(
+            self.attn,
+            KVWriteLoc(
+                forward_batch.out_cache_loc,
+                getattr(backend.forward_metadata, "swa_out_cache_loc", None),
+            ),
+            received[..., :dq].contiguous(),
+            received[..., dq:].contiguous(),
+            None,
+            None,
+        )
+
+        # Window halos: the last keys of every slice, and cached keys left of each chunk.
+        sources = []
+        if meta.cache_rows:
+            k_cache = pool.get_key_buffer(self.attn.layer_id)
+            v_cache = pool.get_value_buffer(self.attn.layer_id)
+            page, offset = meta.cache_page, meta.cache_offset
+            cached = torch.cat(
+                [
+                    k_cache[page, :, :, offset, :].reshape(-1, local_kv_heads, dq),
+                    v_cache[page, :, offset // 8, :, offset % 8],
+                ],
+                dim=-1,
+            )
+            cached = _mimo_attn_tp_gather(cached).view(
+                attn_tp, meta.cache_rows, local_kv_heads, dq + dv
+            )
+            sources.append(
+                cached.transpose(0, 1).reshape(meta.cache_rows, kv_heads, dq + dv)
+            )
+        sources.append(_mimo_attn_tp_gather(own[rows - meta.tail_rows :].contiguous()))
+        sources.append(own)
+        sources.append(own.new_zeros((1, kv_heads, dq + dv)))
+        keys = torch.cat(sources)[meta.kv_src]
+        pages = keys.shape[0] // _SP_SWA_PAGE
+        k_pages = (
+            keys[..., :dq]
+            .reshape(pages, _SP_SWA_PAGE, kv_heads, dq // 8, 8)
+            .permute(0, 2, 3, 1, 4)
+            .contiguous()
+        )
+        v_pages = (
+            keys[..., dq:]
+            .reshape(pages, _SP_SWA_PAGE // 8, 8, kv_heads, dv)
+            .permute(0, 3, 1, 4, 2)
+            .contiguous()
+        )
+
+        out = (q.new_zeros if meta.q_rows < rows else q.new_empty)((rows, heads, dv))
+        if meta.q_rows:
+            unit = torch.ones(1, dtype=torch.float32, device=q.device)
+            flydsl_paged_attention_swa_bf16(
+                q.view(rows, heads, dq)[: meta.q_rows],
+                k_pages,
+                v_pages,
+                meta.cu_seqlens_q,
+                meta.kv_indptr,
+                meta.page_ids,
+                meta.max_q,
+                meta.max_kv,
+                window_left=window,
+                kv_last_page_lens=meta.last_page_lens,
+                q_descale=unit,
+                k_descale=unit,
+                v_descale=unit,
+                out=out[: meta.q_rows],
+                sink_ptr=self.attention_sink_full,
+                softmax_scale=self.scaling,
+                stream=torch.cuda.current_stream(q.device),
+            )
+        return self.o_proj.quant_method.apply(
+            SimpleNamespace(weight=self.o_proj_full), out.view(rows, heads * dv)
         )
 
     def op_prepare(self, state):
@@ -874,7 +1205,11 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        scatter_output: bool = False,
+        sp_swa: bool = False,
     ) -> torch.Tensor:
+        if sp_swa:
+            return self.forward_sp_swa(positions, hidden_states, forward_batch)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
@@ -897,6 +1232,10 @@ class MiMoV2Attention(nn.Module):
                 ..., : self.original_v_head_dim
             ].reshape(-1, self.num_heads * self.original_v_head_dim)
 
+        if scatter_output:
+            return _mimo_sp_o_proj(
+                attn_output, self.o_proj_full, self.o_proj.quant_method
+            )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1043,6 +1382,24 @@ class MiMoV2DecoderLayer(nn.Module):
                 allow_reduce_scatter=True,
                 is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
             )
+        # SGLANG_DPA_SP_SWA: SWA attention on the token shard in extend batches.
+        self.layer_communicator_sp_attn = None
+        if self.self_attn.qkv_proj_full is not None:
+            self.layer_communicator_sp_attn = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes.init_new(
+                    layer_id=layer_id,
+                    num_layers=config.num_hidden_layers,
+                    is_layer_sparse=self.is_layer_sparse,
+                    is_previous_layer_sparse=is_previous_layer_sparse,
+                    is_next_layer_sparse=is_next_layer_sparse,
+                    sp_tp_moe=True,
+                    sp_attn=True,
+                ),
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            )
 
     def _detect_fused_rms_qkv_quant_format(self) -> str:
         """Select the fused RMSNorm + group-quant contract for MiMo QKV."""
@@ -1105,8 +1462,23 @@ class MiMoV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
+        sp_o_proj = sp_swa = False
         if self.layer_communicator_sp is not None and _mimo_sp_moe_active():
             communicator = self.layer_communicator_sp
+            if (
+                self.layer_communicator_sp_attn is not None
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and forward_batch.extend_seq_lens_cpu is not None
+            ):
+                communicator = self.layer_communicator_sp_attn
+                sp_swa = True
+            else:
+                sp_o_proj = (
+                    envs.SGLANG_DPA_SP_OPROJ.get()
+                    and self.self_attn.o_proj_full is not None
+                    and communicator.layer_scatter_modes.mlp_mode
+                    == ScatterMode.SCATTERED
+                )
         # Self Attention
         hidden_states, residual = (
             communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -1123,14 +1495,23 @@ class MiMoV2DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                scatter_output=sp_o_proj,
+                sp_swa=sp_swa,
             )
 
-        hidden_states, residual = communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format=self._prefill_moe_quant_format(forward_batch),
-        )
+        if sp_o_proj:
+            hidden_states, residual = communicator.prepare_mlp_from_scattered_attn(
+                hidden_states,
+                residual,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
+        else:
+            hidden_states, residual = communicator.prepare_mlp(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
 
         should_allreduce_fusion = (
             communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
@@ -1272,7 +1653,7 @@ class MiMoV2Model(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                **get_embedding_tp_kwargs(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -2025,6 +2406,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        for layer in getattr(self.model, "layers", ()):
+            attn = getattr(layer, "self_attn", None)
+            if isinstance(attn, MiMoV2Attention):
+                attn.build_sp_weights()
 
     def get_embed_and_head(self):
         assert (

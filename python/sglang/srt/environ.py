@@ -520,6 +520,9 @@ class Envs:
     SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
     # gfx942 FP8 block-scale linears on the CK bpreshuffle path (>= 2048 tokens) via the
     # FlyDSL kernel ported from PyHIP (layers/quantization/pyhip_fp8_blockscale_gemm.py).
+    # With SGLANG_ENABLE_DPA_SP on 8 ranks, the sequence-parallel TP MoE (I = 256 per rank)
+    # also runs PyHIP's MoE with the top-k sum fused into the reduce-scatter
+    # (layers/moe/pyhip_fp8_blockscale_moe.py).
     SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
     # MiMo DP attention with TP MoE (moe_a2a_backend=none), forward passes with >= 2048
     # global tokens: the residual stays token-scattered over the attention-TP ranks. MoE

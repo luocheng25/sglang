@@ -16,7 +16,7 @@ import itertools
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -161,6 +161,15 @@ def _mimo_sp_moe_sizes() -> List[int]:
 _MIMO_SP_MIN_TOKENS = 2048
 
 
+def _mimo_sp_moe_max_rows() -> int:
+    """Rows per rank of the PyHIP fused reduce-scatter buffer: one prefill chunk's shard
+    (chunked_prefill_size is per DP group), at most 8192 (1 GiB). Larger shards fall back.
+    """
+    chunk = get_global_server_args().chunked_prefill_size
+    rows = -(-chunk // get_attention_tp_size()) if chunk and chunk > 0 else 8192
+    return min(8192, -(-rows // 1024) * 1024)
+
+
 def _mimo_sp_moe_active() -> bool:
     """Use the SGLANG_ENABLE_DPA_SP layout for this forward: the same decision on every rank
     and layer (global token count); small passes and graph capture keep the all-reduce path.
@@ -234,6 +243,11 @@ def _mimo_attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
     out = data.new_empty((get_attention_tp_size() * data.shape[0], *data.shape[1:]))
     get_attention_tp_group().all_gather_into_tensor(out, data)
     return out.view(tensor.dtype)
+
+
+def _mimo_local_rows(tensor: torch.Tensor) -> torch.Tensor:
+    """This attention-TP rank's token slice of a tensor gathered over attention TP."""
+    return tensor.tensor_split(get_attention_tp_size())[get_attention_tp_rank()]
 
 
 @dataclass
@@ -641,6 +655,7 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._sp_tp_moe = should_use_dpa_sp_moe()
+        self._pyhip_moe: Optional[bool] = None
 
     def get_moe_weights(self):
         return [
@@ -716,6 +731,21 @@ class MiMoV2MoE(nn.Module):
             quantized_bytes.view(quantized.dtype),
             _mimo_sp_moe_gather_scales(scale, sizes),
         )
+        if self._use_pyhip_moe(sizes):
+            from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+            x8, x_scale = expert_input
+            tokens, hidden = x8.shape
+            return pyhip_fp8_blockscale_moe.moe_reduce_scatter(
+                self.experts,
+                x8,
+                torch.as_strided(x_scale, (hidden // 128, tokens), (tokens, 1)),
+                topk_weights,
+                topk_ids,
+                sizes,
+                tp_group,
+                _mimo_sp_moe_max_rows(),
+            )
         final_hidden_states = self.experts(expert_input, topk_output)
         if all(size == sizes[0] for size in sizes):
             output = final_hidden_states.new_empty(
@@ -724,6 +754,25 @@ class MiMoV2MoE(nn.Module):
             tp_group.reduce_scatter_tensor(output, final_hidden_states)
             return output
         return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
+
+    def _use_pyhip_moe(self, sizes: List[int]) -> bool:
+        """PyHIP MoE + fused top-k sum / reduce-scatter (SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM)
+        for this forward; the layer check runs once, after weight post-processing."""
+        if self._pyhip_moe is None:
+            self._pyhip_moe = False
+            if envs.SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM.get():
+                from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+                self._pyhip_moe = pyhip_fp8_blockscale_moe.supports_layer(
+                    self.experts, get_tp_group().world_size
+                )
+        if not self._pyhip_moe:
+            return False
+        from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+        return pyhip_fp8_blockscale_moe.fits(
+            sizes, self.experts.w13_weight.shape[0], _mimo_sp_moe_max_rows()
+        )
 
     def forward_normal(
         self,
@@ -1470,6 +1519,7 @@ class MiMoV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        capture_shard: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
         sp_o_proj = sp_swa = False
@@ -1494,10 +1544,21 @@ class MiMoV2DecoderLayer(nn.Module):
                 hidden_states,
                 residual,
                 forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
+                captured_last_layer_outputs=(
+                    None if capture_shard else captured_last_layer_outputs
+                ),
                 quant_format=self._fused_rms_qkv_quant_format,
             )
         )
+        if capture_shard and captured_last_layer_outputs is not None:
+            if (
+                communicator.layer_scatter_modes.layer_input_mode
+                != ScatterMode.SCATTERED
+            ):
+                residual_shard = _mimo_local_rows(residual)
+            else:
+                residual_shard = residual
+            captured_last_layer_outputs.append(residual_shard.clone())
 
         if _mimo_hidden_num_tokens(hidden_states) != 0:
             hidden_states = self.self_attn(
@@ -1656,6 +1717,8 @@ class MiMoV2Model(nn.Module):
         self._logged_no_ep_tbo = False
         self._logged_no_ep_tbo_fallback = False
         self.layers_to_capture: List[int] = []
+        # DFlash draft's context projection (fc + norm), applied on the token shard in SP prefill.
+        self.dflash_context_projector: Optional[Callable] = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1695,6 +1758,18 @@ class MiMoV2Model(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
+
+    def _dflash_capture_on_shards(self, forward_batch: ForwardBatch) -> bool:
+        """Same decision on every rank of an attention-TP group (it decides one all-gather)."""
+        if self.dflash_context_projector is None or not self.layers_to_capture:
+            return False
+        return (
+            getattr(self.layers[self.start_layer], "layer_communicator_sp", None)
+            is not None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and get_attention_tp_size() > 1
+            and _mimo_sp_moe_active()
+        )
 
     def _no_ep_tbo_ineligible_reason(
         self, forward_batch: ForwardBatch
@@ -1785,6 +1860,7 @@ class MiMoV2Model(nn.Module):
                 )
                 self._logged_no_ep_tbo_fallback = True
         aux_hidden_states: List[torch.Tensor] = []
+        capture_shards = False
         if run_tbo:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
@@ -1815,6 +1891,7 @@ class MiMoV2Model(nn.Module):
                 layers_to_capture=self.layers_to_capture,
             )
         else:
+            capture_shards = self._dflash_capture_on_shards(forward_batch)
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -1825,15 +1902,25 @@ class MiMoV2Model(nn.Module):
                     captured_last_layer_outputs=(
                         aux_hidden_states if i in self.layers_to_capture else None
                     ),
+                    capture_shard=capture_shards,
                 )
 
         if (
             self.pp_group.is_last_rank
             and self.config.num_hidden_layers in self.layers_to_capture
         ):
-            aux_hidden_states.append(
+            final_hidden = (
                 hidden_states if residual is None else hidden_states + residual
             )
+            aux_hidden_states.append(
+                _mimo_local_rows(final_hidden) if capture_shards else final_hidden
+            )
+        if capture_shards and aux_hidden_states:
+            # Project the captures on the shard; only the projected rows cross the attention-TP group.
+            context = self.dflash_context_projector(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
+            aux_hidden_states = [_mimo_attn_tp_gather(context)]
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
@@ -2195,6 +2282,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         # DFlash layer ids describe outputs after target layer k. The model
         # captures that tensor immediately before layer k + 1.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_context_projector(self, projector: Callable) -> None:
+        self.model.dflash_context_projector = projector
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

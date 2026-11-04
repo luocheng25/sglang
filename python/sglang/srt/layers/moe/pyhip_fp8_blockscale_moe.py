@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Ported from luocheng25/pyhip at 7f3706caa7a697e2b1489fc24b43756571075fbf:
 # src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_942/{kernels,moe}.py (the I = 256 "direct" path:
-# tiles, gate_up, inverse and down_direct). The top-k sum fused with the reduce-scatter
-# (_sum_rs_kernel) is the FlyDSL form of PyHIP's benchmarks/moe_fp8_blockscale/probes/sum_rs.hip.
-# Only Torch, FlyDSL and AITER (moe_sorting) are required; importing this module does not load
-# the PyHIP package.
+# gate_up and down_direct). The top-k sum fused with the reduce-scatter
+# (_sum_rs_kernel) is the FlyDSL form of PyHIP's benchmarks/moe_fp8_blockscale/probes/sum_rs.hip;
+# the route sort replaces aiter's moe_sorting and PyHIP's tiles / inverse kernels (same rows).
+# Only Torch and FlyDSL are required; importing this module does not load the PyHIP package.
 # Upstream license follows.
 # The MIT License (MIT)
 # Copyright © 2026 <copyright holders>
@@ -18,9 +18,9 @@
 """gfx942 FP8 block-scale TP MoE (prefill, I = 256 per rank) with a fused top-k sum + reduce-scatter.
 
 Kernels (gate_up and down reuse pyhip_fp8_blockscale_gemm's 8-wave staged pipeline: 16x16x32 MFMA,
-16 KiB LDS slots, dword LDS-DMA, 1x128 / 128x128 block scales retired two blocks late). Rows are
-aiter's moe_sorting order (experts padded to 64 rows, padding rows carry token id T), cut by
-_tiles_kernel into compact tiles of one expert: 256 rows, plus one 64-192-row tail per expert. Rows of
+16 KiB LDS slots, dword LDS-DMA, 1x128 / 128x128 block scales retired two blocks late). Rows are in
+aiter's moe_sorting order (experts padded to 64 rows, padding rows carry token id T), produced by the route
+sort with the compact tiles of one expert: 256 rows, plus one 64-192-row tail per expert. Rows of
 a tile past its row count are masked; their 64-row bands (gate_up) / waves (down) issue no MFMAs.
 
 gate_up (_gate_up_body), per (M-block, 128 intermediate columns jt):
@@ -36,7 +36,7 @@ down (_down_direct_body, K = I = 256): 4-wave CTAs, each wave keeps 64 A2 rows (
     consecutive columns, partials retire during the next M-block's MFMAs, and even/odd 32-column units are
     stored back to back (full 128-byte lines). The route weight rides in A2S, so Y rows are already weighted.
     Y [R, H] in sorted order; padding rows are not written.
-inverse: inv[t, k] = sorted row of route (t, k).
+route sort (count, scan, scatter): sorted rows, compact tiles and inv[t, k] = sorted row of route (t, k).
 
 Grids cover the worst-case block count; blocks past the device-side valid count exit, the rest run in
 XCD-chunked order (block b runs on XCD b % 8, which gets a contiguous run of M-blocks, i.e. of experts).
@@ -88,8 +88,6 @@ from sglang.srt.layers.quantization.pyhip_fp8_blockscale_gemm import (
 logger = logging.getLogger(__name__)
 
 FP8_MAX = 240.0
-SUM_THREADS = 256
-TILE_THREADS = 256
 # Short-K down (K <= 256): 4-wave CTAs, two per CU; W2 streams through a ring of two 64-row LDS chunks.
 DOWN_THREADS = 256
 DOWN_CHUNK = 64
@@ -609,7 +607,7 @@ def _gate_up_body(
 
 
 def _tile(TILES, tile):
-    """(first row, rows, expert) of compact tile `tile` (see _tiles_kernel)."""
+    """(first row, rows, expert) of compact tile `tile` (see the route sort)."""
     row0 = _scalar_ready(_read_scalar_g2r(TILES, 2 * tile))
     info = _scalar_ready(_read_scalar_g2r(TILES, 2 * tile + 1))
     return row0, (info >> 16) * 64, info & 0xFFFF
@@ -1162,131 +1160,6 @@ def _down_direct_kernel(
         body(A2, W, A2S, WS, SID, Y, storage, R, T, row0, rows >> 6, cg, expert, N, K)
 
 
-@flyc.kernel(known_block_size=[TILE_THREADS, 1, 1])
-def _tiles_kernel(
-    SEID: fx.Tensor,
-    NV: fx.Tensor,
-    TILES: fx.Tensor,
-    COUNT: fx.Tensor,
-    NB: fx.Int32,
-    CAP: fx.Int32,
-    E: fx.Constexpr[int],
-    BLOCK: fx.Constexpr[int],
-):
-    """Compact tiles from aiter's sorted blocks (BLOCK rows each; every expert one contiguous run): each run
-    is cut into 256-row tiles and one tail of its remaining blocks. TILES[2 t] = first row, TILES[2 t + 1] =
-    expert | rows / 64 << 16, in run order; COUNT[0] = tiles."""
-    _helpers = (
-        _buffer,
-        _load_i32,
-        _load_v4,
-        _store,
-        _read_scalar_g2r,
-        _scalar_ready,
-        _min,
-    )
-    width = max(TILE_THREADS, 1 << (E - 1).bit_length())
-    rounds = width // TILE_THREADS
-    per = BM // BLOCK
-    shared = (
-        fx.SharedAllocator()
-        .allocate(fx.Array[fx.Int32, 3 * width, 16])
-        .peek()
-        .view(fx.make_layout(3 * width, 1))
-    )
-    tid = fx.Int32(gpu.thread_id("x"))
-    for part in range_constexpr(rounds):
-        shared[tid + part * TILE_THREADS] = fx.Int32(0)
-        shared[width + tid + part * TILE_THREADS] = fx.Int32(0)
-    gpu.barrier()
-    seid_res = _buffer(SEID, NB * 4)
-    blocks = _scalar_ready(_read_scalar_g2r(NV, 0)) // BLOCK
-    # Thread t scans blocks 16 t .. + 15 of each round (four dwordx4 loads plus both neighbours in flight).
-    for base in range(fx.Int32(0), blocks, fx.Int32(16 * TILE_THREADS)):
-        b0 = base + tid * 16
-        if b0 < blocks:
-            quads = [_load_v4(seid_res, (b0 + 4 * j) * 4) for j in range(4)]
-            ids = (
-                [_load_i32(seid_res, (b0 - 1) * 4)]
-                + [fx.Int32(quads[i >> 2][i & 3]) for i in range(16)]
-                + [_load_i32(seid_res, (b0 + 16) * 4)]
-            )
-            for i in range_constexpr(16):
-                b = b0 + i
-                e = ids[i + 1]
-                if (b < blocks) & (e >= 0) & (e < E):
-                    if (b == 0) | (ids[i] != e):
-                        shared[e] = b
-                    if (b + 1 == blocks) | (ids[i + 2] != e):
-                        shared[width + e] = b + 1
-    gpu.barrier()
-    for part in range_constexpr(rounds):
-        e = tid + part * TILE_THREADS
-        shared[2 * width + e] = (shared[width + e] - shared[e] + per - 1) // per
-    gpu.barrier()
-    # Inclusive scan of the per-expert tile counts.
-    for shift in range_constexpr(width.bit_length() - 1):
-        d = 1 << shift
-        sums = []
-        for part in range_constexpr(rounds):
-            e = tid + part * TILE_THREADS
-            peer = (e >= d).select(e - d, e)
-            sums.append(
-                shared[2 * width + e]
-                + (e >= d).select(shared[2 * width + peer], fx.Int32(0))
-            )
-        gpu.barrier()
-        for part in range_constexpr(rounds):
-            shared[2 * width + tid + part * TILE_THREADS] = sums[part]
-        gpu.barrier()
-    tiles_res = _buffer(TILES, CAP * 8)
-    for part in range_constexpr(rounds):
-        e = tid + part * TILE_THREADS
-        first = shared[e]
-        size = shared[width + e] - first
-        n = (size + per - 1) // per
-        start = shared[2 * width + e] - n
-        for i in range(fx.Int32(0), n, fx.Int32(1)):
-            rows = _min(fx.Int32(BM), (size - i * per) * BLOCK)
-            _store(fx.Int32((first + i * per) * BLOCK), tiles_res, (start + i) * 8)
-            _store(fx.Int32(e | ((rows >> 6) << 16)), tiles_res, (start + i) * 8 + 4)
-    if tid == 0:
-        _store(fx.Int32(shared[3 * width - 1]), _buffer(COUNT, 4), fx.Int32(0))
-
-
-def _inverse_row(SID, NV, INV, T, R, row, TOPK):
-    valid = _scalar_ready(_read_scalar_g2r(NV, 0))
-    sid = _load_i32(_buffer(SID, R * 4), row * 4)
-    token, slot = sid & 0xFFFFFF, (sid >> 24) & 0xFF
-    target = (slot < TOPK).select((token * TOPK + slot) * 4, fx.Int32(_DROP))
-    target = (token < T).select(target, fx.Int32(_DROP))
-    _store(
-        row, _buffer(INV, T * (TOPK * 4)), (row < valid).select(target, fx.Int32(_DROP))
-    )
-
-
-@flyc.kernel(known_block_size=[SUM_THREADS, 1, 1])
-def _inverse_kernel(
-    SID: fx.Tensor,
-    NV: fx.Tensor,
-    INV: fx.Tensor,
-    T: fx.Int32,
-    R: fx.Int32,
-    TOPK: fx.Constexpr[int],
-):
-    """inv[t * TOPK + k] = sorted row of route (t, k), from the valid prefix of the sorted ids."""
-    _helpers = (
-        _buffer,
-        _load_i32,
-        _store,
-        _read_scalar_g2r,
-        _scalar_ready,
-        _inverse_row,
-    )
-    row = fx.Int32(gpu.block_id("x")) * SUM_THREADS + fx.Int32(gpu.thread_id("x"))
-    _inverse_row(SID, NV, INV, T, R, row, TOPK)
-
-
 def _attrs():
     return {
         "rocdl.waves_per_eu": 2,
@@ -1358,37 +1231,305 @@ def launch_down_direct(
     ).launch(grid=(GRID, 1, 1), block=(DOWN_THREADS, 1, 1), stream=stream)
 
 
-@flyc.jit
-def launch_tiles(
-    SEID: fx.Tensor,
-    NV: fx.Tensor,
-    TILES: fx.Tensor,
+# ---- route sort: the rows of aiter's moe_sorting (block 64), its compact tiles and inv, in 3 kernels ------
+#
+# Expert runs in expert order, empty experts skipped, each padded to 64 rows (token T, slot TOPK, weight 0);
+# an expert's routes in token order. Block b of count / scatter = tokens 256 b .. + 255, one per thread.
+#   count:   COUNTS[b, e] = routes of block b to expert e (LDS atomics).
+#   scan:    one block, thread e: COUNTS[b, e] -> routes of blocks before b to e; COUNTS[NBP + 0 / 1 / 2, e] =
+#            first row / routes / first tile of e; COUNT[0] = tiles.
+#   scatter: a route's row = first row of e + COUNTS[b, e] + routes of earlier tokens of block b to e (LDS
+#            token bitmasks); SID / SW rows and inv[t, k]. Then one expert per wave: its padding rows and
+#            tiles, one per lane.
+SORT_THREADS = 256
+_SORT_WORDS = SORT_THREADS // 32  # bitmask words per expert
+
+
+def _lds_atomic(op, address, value):
+    llvm.atomicrmw(
+        op,
+        _lds(address),
+        fx.Int32(value).ir_value(),
+        llvm.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+    )
+
+
+def _popc(value):
+    return fx.Int32(
+        llvm.call_intrinsic(
+            fx.Int32.ir_type, "llvm.ctpop.i32", [fx.Int32(value).ir_value()], [], []
+        )
+    )
+
+
+@flyc.kernel(known_block_size=[SORT_THREADS, 1, 1])
+def _route_count_kernel(
+    IDS: fx.Tensor,
+    COUNTS: fx.Tensor,
+    T: fx.Int32,
+    E: fx.Constexpr[int],
+    TOPK: fx.Constexpr[int],
+    NBP: fx.Constexpr[int],
+):
+    """COUNTS[b * E + e] = routes of block b's tokens to expert e."""
+    _helpers = (_buffer, _load_v4, _store, _lds, _lds_atomic)
+    hist = (
+        fx.SharedAllocator()
+        .allocate(fx.Array[fx.Int32, SORT_THREADS, 16])
+        .peek()
+        .view(fx.make_layout(SORT_THREADS, 1))
+    )
+    lds = fx.Int32(fx.ptrtoint(fx.get_iter(hist)))
+    tid = fx.Int32(gpu.thread_id("x"))
+    block = fx.Int32(gpu.block_id("x"))
+    hist[tid] = fx.Int32(0)
+    gpu.barrier()
+    t = block * SORT_THREADS + tid
+    if t < T:
+        ids = _buffer(IDS, T * (TOPK * 4))
+        for j in range_constexpr(TOPK // 4):
+            quad = _load_v4(ids, t * (TOPK * 4) + j * 16)
+            for i in range_constexpr(4):
+                _lds_atomic(llvm.AtomicBinOp.add, lds + fx.Int32(quad[i]) * 4, 1)
+    gpu.barrier()
+    if tid < E:
+        _store(fx.Int32(hist[tid]), _buffer(COUNTS, E * NBP * 4), (block * E + tid) * 4)
+
+
+@flyc.kernel(known_block_size=[SORT_THREADS, 1, 1])
+def _route_scan_kernel(
+    COUNTS: fx.Tensor,
     COUNT: fx.Tensor,
     NB: fx.Int32,
-    CAP: fx.Int32,
     E: fx.Constexpr[int],
+    NBP: fx.Constexpr[int],
+    BLOCK: fx.Constexpr[int],
+):
+    """Thread e: COUNTS[b, e] -> routes of blocks before b to expert e; COUNTS[NBP + 0 / 1 / 2, e] = first
+    sorted row / routes / first compact tile of e (rows padded to BLOCK, tiles of 256 rows and one tail, both
+    in expert order); COUNT[0] = tiles."""
+    _helpers = (_buffer, _load_i32, _store)
+    shared = (
+        fx.SharedAllocator()
+        .allocate(fx.Array[fx.Int32, 2 * SORT_THREADS, 16])
+        .peek()
+        .view(fx.make_layout(2 * SORT_THREADS, 1))
+    )
+    e = fx.Int32(gpu.thread_id("x"))
+    live = e < E
+    counts = _buffer(COUNTS, (NBP + 3) * E * 4)
+    total = fx.Int32(0)
+    for c in range_constexpr(NBP // 64):
+        # Blocks >= NB count 0; threads >= E do not store.
+        values = [_load_i32(counts, ((c * 64 + i) * E + e) * 4) for i in range(64)]
+        for i in range_constexpr(64):
+            b = c * 64 + i
+            _store(total, counts, live.select((b * E + e) * 4, fx.Int32(_DROP)))
+            total = total + (live & (NB > b)).select(values[i], fx.Int32(0))
+    padded = (total + BLOCK - 1) // BLOCK * BLOCK
+    per = BM // BLOCK
+    tiles = (padded // BLOCK + per - 1) // per
+    shared[e] = padded
+    shared[SORT_THREADS + e] = tiles
+    gpu.barrier()
+    # Inclusive scans of the padded rows and the tiles over the experts.
+    for shift in range_constexpr(SORT_THREADS.bit_length() - 1):
+        d = 1 << shift
+        peer = (e >= d).select(e - d, e)
+        rows_sum = shared[e] + (e >= d).select(shared[peer], fx.Int32(0))
+        tiles_sum = shared[SORT_THREADS + e] + (e >= d).select(
+            shared[SORT_THREADS + peer], fx.Int32(0)
+        )
+        gpu.barrier()
+        shared[e] = rows_sum
+        shared[SORT_THREADS + e] = tiles_sum
+        gpu.barrier()
+    first = fx.Int32(shared[e]) - padded
+    tile0 = fx.Int32(shared[SORT_THREADS + e]) - tiles
+    for i, value in enumerate((first, total, tile0)):
+        _store(value, counts, live.select(((NBP + i) * E + e) * 4, fx.Int32(_DROP)))
+    if e == 0:
+        _store(fx.Int32(shared[2 * SORT_THREADS - 1]), _buffer(COUNT, 4), fx.Int32(0))
+
+
+@flyc.kernel(known_block_size=[SORT_THREADS, 1, 1])
+def _route_scatter_kernel(
+    IDS: fx.Tensor,
+    W: fx.Tensor,
+    COUNTS: fx.Tensor,
+    SID: fx.Tensor,
+    SW: fx.Tensor,
+    INV: fx.Tensor,
+    TILES: fx.Tensor,
+    T: fx.Int32,
+    R: fx.Int32,
+    CAP: fx.Int32,
+    NB: fx.Int32,
+    E: fx.Constexpr[int],
+    TOPK: fx.Constexpr[int],
+    NBP: fx.Constexpr[int],
+    BLOCK: fx.Constexpr[int],
+):
+    """Route (t, k) of block b to expert e -> row first(e) + COUNTS[b, e] + tokens of block b before t routed
+    to e: SID = k << 24 | t, SW = its weight, INV[t, k] = row. Wave w of block b then writes the padding rows
+    (SID = TOPK << 24 | T, SW = 0) and the tiles (TILES[2 i] = first row, TILES[2 i + 1] = e | rows / 64 << 16)
+    of experts e = 4 b + w + 4 NB j."""
+    _helpers = (
+        _buffer,
+        _load_i32,
+        _load_v4,
+        _store,
+        _lds,
+        _lds_atomic,
+        _lds_load_v4,
+        _lds_store_v4,
+        _popc,
+        _min,
+    )
+    masks = SORT_THREADS * _SORT_WORDS
+    shared = (
+        fx.SharedAllocator()
+        .allocate(fx.Array[fx.Int32, masks + SORT_THREADS, 16])
+        .peek()
+        .view(fx.make_layout(masks + SORT_THREADS, 1))
+    )
+    lds = fx.Int32(fx.ptrtoint(fx.get_iter(shared)))
+    tid = fx.Int32(gpu.thread_id("x"))
+    block = fx.Int32(gpu.block_id("x"))
+    zero = fx.Vector.filled(4, 0, fx.Int32)
+    for h in range_constexpr(_SORT_WORDS // 4):
+        _lds_store_v4(lds + tid * (_SORT_WORDS * 4) + h * 16, zero)
+    counts = _buffer(COUNTS, (NBP + 3) * E * 4)
+    shared[masks + tid] = _load_i32(counts, (block * E + tid) * 4) + _load_i32(
+        counts, (NBP * E + tid) * 4
+    )
+    gpu.barrier()
+    t = block * SORT_THREADS + tid
+    word, bit = tid >> 5, tid & 31
+    if t < T:
+        ids = _buffer(IDS, T * (TOPK * 4))
+        for j in range_constexpr(TOPK // 4):
+            quad = _load_v4(ids, t * (TOPK * 4) + j * 16)
+            for i in range_constexpr(4):
+                _lds_atomic(
+                    llvm.AtomicBinOp._or,
+                    lds + (fx.Int32(quad[i]) * _SORT_WORDS + word) * 4,
+                    fx.Int32(1) << bit,
+                )
+    gpu.barrier()
+    if t < T:
+        ids = _buffer(IDS, T * (TOPK * 4))
+        weights = _buffer(W, T * (TOPK * 4))
+        sid = _buffer(SID, R * 4)
+        sw = _buffer(SW, R * 4)
+        rows = []
+        for j in range_constexpr(TOPK // 4):
+            quad = _load_v4(ids, t * (TOPK * 4) + j * 16)
+            wquad = _load_v4(weights, t * (TOPK * 4) + j * 16)
+            for i in range_constexpr(4):
+                k = j * 4 + i
+                expert = fx.Int32(quad[i])
+                words = []
+                for h in range_constexpr(_SORT_WORDS // 4):
+                    quad_w = _lds_load_v4(lds + expert * (_SORT_WORDS * 4) + h * 16)
+                    words += [fx.Int32(quad_w[v]) for v in range(4)]
+                rank = fx.Int32(0)
+                for w in range_constexpr(_SORT_WORDS):
+                    below = (word > w).select(
+                        fx.Int32(-1),
+                        (word == w).select((fx.Int32(1) << bit) - 1, fx.Int32(0)),
+                    )
+                    rank = rank + _popc(words[w] & below)
+                row = fx.Int32(shared[masks + expert]) + rank
+                _store(fx.Int32(k << 24) | t, sid, row * 4)
+                _store(fx.Int32(wquad[i]), sw, row * 4)
+                rows.append(row)
+        inv = _buffer(INV, T * (TOPK * 4))
+        for j in range_constexpr(TOPK // 4):
+            _store(
+                fx.Vector.from_elements(rows[4 * j : 4 * j + 4], fx.Int32),
+                inv,
+                t * (TOPK * 4) + j * 16,
+            )
+    lane = tid & 63
+    sid = _buffer(SID, R * 4)
+    sw = _buffer(SW, R * 4)
+    out = _buffer(TILES, CAP * 8)
+    pad = fx.Int32(TOPK << 24) | T
+    per = BM // BLOCK
+    for e in range(block * 4 + (tid >> 6), fx.Int32(E), NB * 4):
+        expert = fx.Int32(e)
+        first = _load_i32(counts, (NBP * E + expert) * 4)
+        total = _load_i32(counts, ((NBP + 1) * E + expert) * 4)
+        tile0 = _load_i32(counts, ((NBP + 2) * E + expert) * 4)
+        padded = (total + BLOCK - 1) // BLOCK * BLOCK
+        r = first + total + lane
+        offset = (r < first + padded).select(r * 4, fx.Int32(_DROP))
+        _store(pad, sid, offset)
+        _store(fx.Int32(0), sw, offset)
+        tiles = (padded // BLOCK + per - 1) // per
+        for i0 in range(fx.Int32(0), tiles, fx.Int32(64)):
+            i = fx.Int32(i0) + lane
+            rows = _min(fx.Int32(BM), padded - i * BM)
+            offset = (i < tiles).select((tile0 + i) * 8, fx.Int32(_DROP))
+            _store(fx.Int32(first + i * BM), out, offset)
+            _store(fx.Int32(expert | ((rows >> 6) << 16)), out, offset + 4)
+
+
+@flyc.jit
+def launch_route_count(
+    IDS: fx.Tensor,
+    COUNTS: fx.Tensor,
+    T: fx.Int32,
+    GRID: fx.Int32,
+    E: fx.Constexpr[int],
+    TOPK: fx.Constexpr[int],
+    NBP: fx.Constexpr[int],
+    stream: fx.Stream,
+):
+    _route_count_kernel(IDS, COUNTS, T, E, TOPK, NBP).launch(
+        grid=(GRID, 1, 1), block=(SORT_THREADS, 1, 1), stream=stream
+    )
+
+
+@flyc.jit
+def launch_route_scan(
+    COUNTS: fx.Tensor,
+    COUNT: fx.Tensor,
+    NB: fx.Int32,
+    E: fx.Constexpr[int],
+    NBP: fx.Constexpr[int],
     BLOCK: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    _tiles_kernel(SEID, NV, TILES, COUNT, NB, CAP, E, BLOCK).launch(
-        grid=(1, 1, 1), block=(TILE_THREADS, 1, 1), stream=stream
+    _route_scan_kernel(COUNTS, COUNT, NB, E, NBP, BLOCK).launch(
+        grid=(1, 1, 1), block=(SORT_THREADS, 1, 1), stream=stream
     )
 
 
 @flyc.jit
-def launch_inverse(
+def launch_route_scatter(
+    IDS: fx.Tensor,
+    W: fx.Tensor,
+    COUNTS: fx.Tensor,
     SID: fx.Tensor,
-    NV: fx.Tensor,
+    SW: fx.Tensor,
     INV: fx.Tensor,
+    TILES: fx.Tensor,
     T: fx.Int32,
     R: fx.Int32,
-    GRID: fx.Int32,
+    CAP: fx.Int32,
+    NB: fx.Int32,
+    E: fx.Constexpr[int],
     TOPK: fx.Constexpr[int],
+    NBP: fx.Constexpr[int],
+    BLOCK: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    _inverse_kernel(SID, NV, INV, T, R, TOPK).launch(
-        grid=(GRID, 1, 1), block=(SUM_THREADS, 1, 1), stream=stream
-    )
+    _route_scatter_kernel(
+        IDS, W, COUNTS, SID, SW, INV, TILES, T, R, CAP, NB, E, TOPK, NBP, BLOCK
+    ).launch(grid=(NB, 1, 1), block=(SORT_THREADS, 1, 1), stream=stream)
 
 
 # ---- fused top-k sum + reduce-scatter (sequence-parallel layout, 8 ranks, HIP IPC) ----------------------
@@ -1398,20 +1539,25 @@ def launch_inverse(
 # out (rank s, row u < size[s]) = bf16(sum over ranks in rank order of bf16(sum_k Y[INV[off[s] + u, k]])),
 # sums in FP32. Unit u = row u of every shard. Persistent grid of RS_GRID 512-thread WGs (all resident),
 # units u = block + j * grid below the largest shard; (u, s) with u >= size[s] are skipped.
-#   RS: waves 0-3 sum the 8 route rows of token (unit u, destination s rotated by u) and write a quarter row
-#      into an LDS ring; waves 4-7 copy it to rank s's inbox[parity][rank][u] with write-through stores and,
+#   RS: waves 0-3 sum the 8 route rows of token (unit u, destination s) and write a quarter row into an LDS
+#      ring; waves 4-5 copy two quarters each to rank s's inbox[parity][rank][u] with write-through stores and,
 #      after a unit, set flag[rank][u][quarter] = epoch on its destinations (monotonic, never reset).
-#   reduce: wait for this rank's rows' flags, sum the 8 inbox rows in rank order (L2-bypassing loads).
+#      s rotates by block // 8, so the WGs writing to one destination at a time write adjacent rows.
+#   reduce: wait for this rank's rows' flags, sum the 8 inbox rows in rank order (L2-bypassing loads),
+#      _RS_UNITS units per step.
 # RS never waits on another rank (no deadlock with all WGs resident); a peer is at most one epoch ahead, so
 # the inbox alternates by epoch parity. Destination s's inbox / flag rows are src * size[s] + u.
 
-RS_GRID = 96  # more concurrent remote writers congest xGMI (16K/32K: 96 -> 543/1091 us, 304 -> 1461/2860)
+# Fewer pushing WGs congest xGMI less, more WGs sum faster (32K: 64 / 80 / 96 / 112 -> 1035 / 988 / 1036 / 1168 us).
+RS_GRID = 80
 _RS_THREADS = 512
 _RS_SLOTS = 4  # LDS ring rows
+_RS_UNITS = 4  # reduce units per step
 _ROW = 4096 * 2  # bytes per hidden row
-_QUARTER = 4096 // 8 // 4  # 16-byte vectors per row quarter (one sum / push wave pair)
-# Buffer cache policy: nt; sc0 | sc1 (write-through stores, L2-bypassing loads); sc1 (system-scope atomic).
-_AUX_NT, _AUX_SYS, _AUX_SC1 = 2, 17, 16
+_QUARTER = 4096 // 8 // 4  # 16-byte vectors per row quarter (one sum wave)
+# Buffer cache policy: nt; sc0 | sc1 (write-through stores, L2-bypassing loads); sc1 (system-scope atomic);
+# sc0 | sc1 | nt (inbox stores).
+_AUX_NT, _AUX_SYS, _AUX_SC1, _AUX_SYS_NT = 2, 17, 16, 19
 
 
 def symmetric_buffer_bytes(rcap: int) -> int:
@@ -1648,7 +1794,7 @@ def _sum_rs_kernel(
     def dest(seq):
         # seq -> (unit, destination rank, its shard size); valid if u < size
         u = block + (seq >> 3) * G
-        s = (RANK + u + (seq & 7)) & 7
+        s = (RANK + (block >> 3) + (seq & 7)) & 7
         size = _pick(s, sizes)
         return u, s, size
 
@@ -1707,61 +1853,94 @@ def _sum_rs_kernel(
         for cur in range(fx.Int32(0), rows, fx.Int32(2)):
             state = sum_pair(*state, cur)
     else:
-        # Push role: LDS quarter -> rank s's inbox (write-through); per unit, flags on its destinations.
-        for seq in range(fx.Int32(0), rows, fx.Int32(1)):
-            u, s, size = dest(seq)
-            if u < size:
-                while _counter_load(prod) < seq + 1:
-                    rocdl.s_sleep(0)
-                slot = lds + (seq & (_RS_SLOTS - 1)) * _ROW + lane_off
-                v = [_lds_load_v4(slot + h * 1024) for h in range(2)]
-                _counter_store(cons, seq + 1)
-                r = _rsrc(
-                    _pick(s, peers)
-                    + inbox_off
-                    + (fx.Int64(RANK) * fx.Int64(size) + fx.Int64(u)) * _ROW,
-                    fx.Int32(_ROW),
-                )
-                for h in range_constexpr(2):
-                    _store_v4_aux(v[h], r, lane_off + h * 1024, _AUX_SYS)
-            else:
-                _counter_store(cons, seq + 1)
-            if (seq & 7) == 7:
-                # This wave's write-through inbox stores are acknowledged before its flags.
-                llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
-                _wait(vmcnt=0)
-                if lane == 0:
-                    for d in range_constexpr(8):
-                        live = u < sizes[d]
-                        _flag_swap(
-                            _rsrc(
+        if wave < 6:
+            # Push role: two LDS quarters -> rank s's inbox (write-through); per unit, flags on its destinations.
+            q0 = (wave - 4) * 2
+            for seq in range(fx.Int32(0), rows, fx.Int32(1)):
+                u, s, size = dest(seq)
+                if u < size:
+                    v = []
+                    for i in range_constexpr(2):
+                        counter = lds + _RS_SLOTS * _ROW + (q0 + i) * 4
+                        while _counter_load(counter) < seq + 1:
+                            rocdl.s_sleep(0)
+                        slot = (
+                            lds
+                            + (seq & (_RS_SLOTS - 1)) * _ROW
+                            + ((q0 + i) * _QUARTER + lane) * 16
+                        )
+                        v += [_lds_load_v4(slot + h * 1024) for h in range(2)]
+                    for i in range_constexpr(2):
+                        _counter_store(
+                            lds + _RS_SLOTS * _ROW + (q0 + i) * 4 + 16, seq + 1
+                        )
+                    r = _rsrc(
+                        _pick(s, peers)
+                        + inbox_off
+                        + (fx.Int64(RANK) * fx.Int64(size) + fx.Int64(u)) * _ROW,
+                        fx.Int32(_ROW),
+                    )
+                    for i in range_constexpr(2):
+                        for h in range_constexpr(2):
+                            _store_v4_aux(
+                                v[2 * i + h],
+                                r,
+                                ((q0 + i) * _QUARTER + lane) * 16 + h * 1024,
+                                _AUX_SYS_NT,
+                            )
+                else:
+                    for i in range_constexpr(2):
+                        _counter_store(
+                            lds + _RS_SLOTS * _ROW + (q0 + i) * 4 + 16, seq + 1
+                        )
+                if (seq & 7) == 7:
+                    # This wave's write-through inbox stores are acknowledged before its flags.
+                    llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
+                    _wait(vmcnt=0)
+                    if lane == 0:
+                        for d in range_constexpr(8):
+                            live = u < sizes[d]
+                            flag_rsrc = _rsrc(
                                 peers[d] + flags_off,
                                 live.select(flags_bytes, fx.Int32(0)),
-                            ),
-                            ((RANK * sizes[d] + u) * 4 + q) * 4,
-                            EPOCH,
-                        )
+                            )
+                            for i in range_constexpr(2):
+                                _flag_swap(
+                                    flag_rsrc,
+                                    ((RANK * sizes[d] + u) * 4 + q0 + i) * 4,
+                                    EPOCH,
+                                )
     _stage_end()
 
-    # Reduce this rank's rows.
+    # Reduce this rank's rows, _RS_UNITS units per step (units of one step are G apart).
     own = _pick(RANK, sizes)
     own_base = _pick(RANK, peers)
     inbox = _rsrc(own_base + inbox_off, fx.Int32(0x7FFFFFFF))
     flags = _rsrc(own_base + flags_off, flags_bytes)
     out = _buffer(OUT, own * _ROW)
-    for u in range(block, own, G):
-        if tid < 32:
-            flag = (((tid >> 2) * own + u) * 4 + (tid & 3)) * 4
-            while _flag_load(flags, flag) < EPOCH:
-                rocdl.s_sleep(1)
+    for u0 in range(block, own, G * _RS_UNITS):
+        if tid < 32 * _RS_UNITS:
+            uw = u0 + (tid >> 5) * G
+            if uw < own:
+                flag = ((((tid >> 2) & 7) * own + uw) * 4 + (tid & 3)) * 4
+                while _flag_load(flags, flag) < EPOCH:
+                    rocdl.s_sleep(1)
             # Inbox reads stay after the flags (they bypass the caches: sc0 sc1).
             llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
         _stage_end()
-        rows_in = [
-            _load_v4_aux(inbox, (src * own + u) * _ROW + tid * 16, _AUX_SYS)
-            for src in range(8)
-        ]
-        _store_v4_aux(_sum_bf16(rows_in), out, u * _ROW + tid * 16, 0)
+        rows_in = []
+        for k in range_constexpr(_RS_UNITS):
+            u = u0 + k * G
+            row = (u < own).select(u, fx.Int32(0))
+            rows_in.append(
+                [
+                    _load_v4_aux(inbox, (src * own + row) * _ROW + tid * 16, _AUX_SYS)
+                    for src in range(8)
+                ]
+            )
+        # Units past the shard store past the end of OUT (dropped).
+        for k in range_constexpr(_RS_UNITS):
+            _store_v4_aux(_sum_bf16(rows_in[k]), out, (u0 + k * G) * _ROW + tid * 16, 0)
 
 
 @flyc.jit
@@ -1868,6 +2047,69 @@ def _workspace(device, rows, inter, hidden):
     return tuple(h[:n] for h, n in zip(have, need))
 
 
+def _route_sort(topk_ids, topk_weights, experts, rows, cap):
+    """The rows of aiter's moe_sorting (block COMPACT_BLOCK), their compact tiles and inv: (SID [rows],
+    SW [rows], INV [T, TOPK], TILES [2 cap], COUNT [1]); rows past the padded routes are not written.
+    """
+    tokens = topk_ids.shape[0]
+    device = topk_ids.device
+    stream = torch.cuda.current_stream(device)
+    blocks = (tokens + SORT_THREADS - 1) // SORT_THREADS
+    nbp = (blocks + 63) // 64 * 64
+    i32 = torch.int32
+    counts = torch.empty((nbp + 3) * experts, dtype=i32, device=device)
+    sid = torch.empty(rows, dtype=i32, device=device)
+    sw = torch.empty(rows, dtype=torch.float32, device=device)
+    inv = torch.empty((tokens, TOPK), dtype=i32, device=device)
+    tiles = torch.empty(2 * cap, dtype=i32, device=device)
+    count = torch.empty(1, dtype=i32, device=device)
+    ids, weights = topk_ids.view(-1), topk_weights.view(-1)
+    _run(
+        ("route_count", device, experts, nbp),
+        launch_route_count,
+        ids,
+        counts,
+        tokens,
+        blocks,
+        experts,
+        TOPK,
+        nbp,
+        stream,
+    )
+    _run(
+        ("route_scan", device, experts, nbp),
+        launch_route_scan,
+        counts,
+        count,
+        blocks,
+        experts,
+        nbp,
+        COMPACT_BLOCK,
+        stream,
+    )
+    _run(
+        ("route_scatter", device, experts, nbp),
+        launch_route_scatter,
+        ids,
+        weights,
+        counts,
+        sid,
+        sw,
+        inv.view(-1),
+        tiles,
+        tokens,
+        rows,
+        cap,
+        blocks,
+        experts,
+        TOPK,
+        nbp,
+        COMPACT_BLOCK,
+        stream,
+    )
+    return sid, sw, inv, tiles, count
+
+
 def moe_route_rows(x8, xs, w13, w2, topk_weights, topk_ids, w13_scale, w2_scale):
     """Route rows of a TP MoE with I = 256 per rank: (Y [rows, H] BF16 in sorted order with the route weight
     folded in, inv [T, topk] int32 = row of route (t, k)), so out[t] = sum_k Y[inv[t, k]].
@@ -1877,42 +2119,17 @@ def moe_route_rows(x8, xs, w13, w2, topk_weights, topk_ids, w13_scale, w2_scale)
     [E, 2 I / 128, H / 128], w2_scale: [E, H / 128, I / 128] FP32; topk_ids / topk_weights: [T, topk]
     int32 / FP32. Y is a workspace view, valid until the next call.
     """
-    from aiter.fused_moe import moe_sorting
-
     tokens, hidden = x8.shape
     experts, inter = w13.shape[0], w2.shape[2]
-    sid, sw, seid, nv, _ = moe_sorting(
-        topk_ids,
-        topk_weights,
-        experts,
-        hidden,
-        torch.bfloat16,
-        block_size=COMPACT_BLOCK,
-        accumulate=False,
-    )
-    rows, blocks = sid.numel(), seid.numel()
+    # Row capacity of aiter's moe_sorting: every expert's run padded to COMPACT_BLOCK rows.
+    rows = tokens * TOPK + experts * COMPACT_BLOCK - TOPK
+    per = BM // COMPACT_BLOCK
+    cap = ((rows + COMPACT_BLOCK - 1) // COMPACT_BLOCK + per - 1) // per + experts
+    sid, sw, inv, tiles, count = _route_sort(topk_ids, topk_weights, experts, rows, cap)
     device = x8.device
     stream = torch.cuda.current_stream(device)
     a2, a2s, y = _workspace(device, rows, inter, hidden)
-    inv = torch.full((tokens, TOPK), -1, dtype=torch.int32, device=device)
-    per = BM // COMPACT_BLOCK
-    cap = (blocks + per - 1) // per + experts
-    tiles = torch.empty(2 * cap, dtype=torch.int32, device=device)
-    count = torch.empty(1, dtype=torch.int32, device=device)
     u8 = torch.uint8
-    _run(
-        ("tiles", device, experts),
-        launch_tiles,
-        seid,
-        nv,
-        tiles,
-        count,
-        blocks,
-        cap,
-        experts,
-        COMPACT_BLOCK,
-        stream,
-    )
     _run(
         ("gate_up", device, inter, hidden),
         launch_gate_up,
@@ -1931,18 +2148,6 @@ def moe_route_rows(x8, xs, w13, w2, topk_weights, topk_ids, w13_scale, w2_scale)
         cap * (inter // 128),
         inter,
         hidden,
-        stream,
-    )
-    _run(
-        ("inverse", device),
-        launch_inverse,
-        sid,
-        nv,
-        inv.view(-1),
-        tokens,
-        rows,
-        (rows + SUM_THREADS - 1) // SUM_THREADS,
-        TOPK,
         stream,
     )
     groups = hidden // DOWN_COLS
@@ -1971,7 +2176,8 @@ def moe_route_rows(x8, xs, w13, w2, topk_weights, topk_ids, w13_scale, w2_scale)
 
 def supports_layer(layer, tp_size: int) -> bool:
     """FusedMoE `layer` matches the kernels: gfx942 FP8 128x128 block-scale experts (aiter-shuffled), H 4096,
-    I 256 per rank, top-8 SiLU-gated, TP8 without EP / shared-expert fusion / clamps / biases.
+    I 256 per rank, at most 256 experts, top-8 SiLU-gated, TP8 without EP / shared-expert fusion / clamps /
+    biases.
     """
     cfg = getattr(layer, "moe_runner_config", None)
     w13, w2 = getattr(layer, "w13_weight", None), getattr(layer, "w2_weight", None)
@@ -1984,6 +2190,7 @@ def supports_layer(layer, tp_size: int) -> bool:
     return (
         "gfx942" in torch.cuda.get_device_properties(w13.device).gcnArchName
         and tp_size == RANKS
+        and experts <= SORT_THREADS
         and cfg.top_k == TOPK
         and getattr(layer, "moe_ep_size", 1) == 1
         and cfg.activation == "silu"

@@ -332,10 +332,10 @@ def _mimo_sp_swa_metadata(
 
         req_rows = torch.cat(
             [torch.full((c,), i) for i, c in enumerate(cache_counts) if c]
-        ).to(device)
+        ).to(device, non_blocking=True)
         positions = torch.cat(
             [torch.arange(p - c, p) for p, c in zip(prefixes, cache_counts) if c]
-        ).to(device)
+        ).to(device, non_blocking=True)
         full_loc = get_req_to_token_pool().req_to_token[
             forward_batch.req_pool_indices[req_rows].long(), positions
         ]

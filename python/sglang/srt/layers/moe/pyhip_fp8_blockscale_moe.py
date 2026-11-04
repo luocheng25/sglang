@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Ported from luocheng25/pyhip at cab0421b1bfe71d052519542d66d5bc5e3427415:
+# Ported from luocheng25/pyhip at 7f3706caa7a697e2b1489fc24b43756571075fbf:
 # src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_942/{kernels,moe}.py (the I = 256 "direct" path:
 # tiles, gate_up, inverse and down_direct). The top-k sum fused with the reduce-scatter
 # (_sum_rs_kernel) is the FlyDSL form of PyHIP's benchmarks/moe_fp8_blockscale/probes/sum_rs.hip.
@@ -29,7 +29,8 @@ gate_up (_gate_up_body), per (M-block, 128 intermediate columns jt):
     up I + 128 jt .. + 127] (P1 = gate, P2 = up), so wave (wm, wn) holds gate (N-blocks 0-3) and up (4-7) of
     the same 64 columns and C1 / C2 use the gate / up weight scale. Epilogue: SiLU(gate) * up, row maxima
     over the 128-column group (two waves, exchanged in LDS), FP8 E4M3FNUZ requant ->
-    A2 [R, I] (sorted rows) and A2S [I / 128, R] = amax / 240 * route weight.
+    A2 [R, I] (sorted rows; staged in LDS so every store writes whole 128-byte rows) and
+    A2S [I / 128, R] = amax / 240 * route weight.
 down (_down_direct_body, K = I = 256): 4-wave CTAs, each wave keeps 64 A2 rows (whole K) in registers while
     W2 streams through a 2-slot LDS ring in 64-row chunks; MFMA A rows are permuted so each lane's outputs are 8
     consecutive columns, partials retire during the next M-block's MFMAs, and even/odd 32-column units are
@@ -276,18 +277,45 @@ def _act_epilogue(
     route = _load_f32(sw_res, (wm * 64 + lane) * 4)
     _wait(lgkmcnt=0)
 
+    # The FP8 tile goes through LDS so every store writes whole 128-byte rows: tile row r at 4 KiB of region
+    # r >> 5 (clear of the row maxima), 16-byte chunks swizzled by r & 7.
+    for mb in range(4):
+        top = _max(amax[mb], partner[mb])
+        inv = (top > fx.Float32(0.0)).select(fx.Float32(FP8_MAX) / top, fx.Float32(0.0))
+        stage = (
+            shared
+            + (2 * wm + (mb >> 1)) * 8192
+            + 4096
+            + (16 * (mb & 1) + r16) * 128
+            + g * 4
+        )
+        for nbl in range(4):
+            word = _cvt_fp8x4([act[nbl][4 * mb + e] * inv for e in range(4)])
+            _write_lds_f32(stage + (((4 * wn + nbl) ^ (r16 & 7)) << 4), _as_f32(word))
+    _wait(lgkmcnt=0)
+    _stage_end()
+    # Wave w stores tile rows 32 w .. + 31; lane l: row 8 i + (l >> 3), chunk l & 7.
+    rows8 = [
+        _read_address(
+            shared
+            + wave * 8192
+            + 4096
+            + (8 * i + (lane >> 3)) * 128
+            + (((lane & 7) ^ (lane >> 3)) << 4)
+        )
+        for i in range(4)
+    ]
     a2_res = _buffer(
         fx.make_view(fx.get_iter(A2) + fx.Int64(row0) * I, fx.make_layout(BM * I, 1)),
         rows * I,
     )
-    column = jt * 128 + wn * 64 + g * 4
-    for mb in range(4):
-        top = _max(amax[mb], partner[mb])
-        inv = (top > fx.Float32(0.0)).select(fx.Float32(FP8_MAX) / top, fx.Float32(0.0))
-        row = wm * 64 + 16 * mb + r16
-        for nbl in range(4):
-            word = _cvt_fp8x4([act[nbl][4 * mb + e] * inv for e in range(4)])
-            _store(word, a2_res, row * I + column + nbl * 16)
+    _wait(lgkmcnt=0)
+    for i in range(4):
+        _store(
+            rows8[i],
+            a2_res,
+            (wave * 32 + 8 * i + (lane >> 3)) * I + jt * 128 + (lane & 7) * 16,
+        )
     # Scale (times the route weight) of token `lane` of the wave, written by the wn = 0 wave.
     top = _max(own, partner_own)
     scale = (top > fx.Float32(0.0)).select(
@@ -358,6 +386,7 @@ def _gate_up_body(
         _cvt_fp8x4,
         _retire_last,
         _act_epilogue,
+        _read_address,
     )
     KB = K // BK
     tid = fx.Int32(gpu.thread_id("x"))

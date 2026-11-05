@@ -43,11 +43,13 @@ XCD-chunked order (block b runs on XCD b % 8, which gets a contiguous run of M-b
 
 _sum_rs_kernel (sequence-parallel layout, 8 ranks): the top-k sum of every token's route rows,
 summed over the ranks and scattered to the token's owner rank in one kernel (HIP IPC symmetric buffers).
+_a2a_kernel: all_to_all_single with equal blocks on a 4-rank group (the same IPC push and flags), for the
+attention-TP exchanges of that layout.
 """
 
 import ctypes
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -2352,3 +2354,174 @@ def moe_reduce_scatter(
         layer.w2_weight_scale_inv,
     )
     return _reduce_scatter(y, inv, sizes)
+
+
+# ---- All-to-all on a 4-rank group (HIP IPC), e.g. the SP SWA K/V exchange over attention TP -------------
+# SEND [4 dst][NB bytes] -> OUT [4 src][NB bytes] (all_to_all_single with equal blocks). WG u moves unit u
+# (_A2A_UNIT bytes) of every block: the own block's unit -> OUT, the peers' units -> their inbox[parity][RANK]
+# (write-through). Once its stores are acknowledged, each wave raises flag[RANK][u][wave] to the epoch on the
+# peers (monotonic, never reset); the WG then waits for the peers' 12 flags of unit u and copies their inbox
+# units to OUT (L2-bypassing loads). One unit per WG keeps every store in flight at once. Collectives
+# between two exchanges order the ranks (a peer is at most one exchange ahead): the inbox alternates by parity.
+_A2A_THREADS = 256
+_A2A_VECS = 4  # 16-byte vectors per thread and block
+_A2A_UNIT = _A2A_THREADS * _A2A_VECS * 16
+_A2A_RANKS = 4
+
+
+def a2a_buffer_bytes(cap: int) -> int:
+    """[2 parity][4 src][cap] inbox + [4 src][cap / _A2A_UNIT][4 waves] int32 flags (cap: unit multiple)."""
+    return 2 * _A2A_RANKS * cap + _A2A_RANKS * (cap // _A2A_UNIT) * 16
+
+
+@flyc.kernel(known_block_size=[_A2A_THREADS, 1, 1])
+def _a2a_kernel(
+    SEND: fx.Tensor,
+    OUT: fx.Tensor,
+    P0: fx.Int64,
+    P1: fx.Int64,
+    P2: fx.Int64,
+    P3: fx.Int64,
+    NB: fx.Int32,
+    CAP: fx.Int32,
+    RANK: fx.Int32,
+    EPOCH: fx.Int32,
+):
+    _helpers = (
+        _aux,
+        _rsrc,
+        _load_v4_aux,
+        _store_v4_aux,
+        _flag_load,
+        _flag_swap,
+        _pick,
+        _stage_end,
+        _uniform,
+        _wait,
+    )
+    peers = [P0, P1, P2, P3]
+    tid = fx.Int32(gpu.thread_id("x"))
+    unit = fx.Int32(gpu.block_id("x"))
+    wave = _uniform(tid >> 6)
+    lane = tid & 63
+    ucap = CAP // _A2A_UNIT
+    inbox_off = fx.Int64(EPOCH & 1) * fx.Int64(CAP) * _A2A_RANKS
+    flags_off = fx.Int64(CAP) * (2 * _A2A_RANKS)
+    flags_bytes = ucap * (_A2A_RANKS * 16)
+    send_base = fx.Int64(fx.ptrtoint(fx.get_iter(SEND)))
+    out_base = fx.Int64(fx.ptrtoint(fx.get_iter(OUT)))
+    offs = [unit * _A2A_UNIT + (tid + i * _A2A_THREADS) * 16 for i in range(_A2A_VECS)]
+    # Own block first, then the peers rotated by the unit (the WGs spread over the links).
+    turns = [unit + j for j in range(_A2A_RANKS - 1)]
+    dests = [RANK] + [(RANK + 1 + t - t // 3 * 3) & 3 for t in turns]
+    srcs = [_rsrc(send_base + fx.Int64(d) * fx.Int64(NB), NB) for d in dests]
+    data = [[_load_v4_aux(s, o, _AUX_NT) for o in offs] for s in srcs]
+    dsts = [_rsrc(out_base + fx.Int64(RANK) * fx.Int64(NB), NB)] + [
+        _rsrc(_pick(d, peers) + inbox_off + fx.Int64(RANK) * fx.Int64(CAP), NB)
+        for d in dests[1:]
+    ]
+    bits = [0] + [_AUX_SYS_NT] * (_A2A_RANKS - 1)
+    for j in range_constexpr(_A2A_RANKS):
+        for i in range_constexpr(_A2A_VECS):
+            _store_v4_aux(data[j][i], dsts[j], offs[i], bits[j])
+    # This wave's write-through inbox stores are acknowledged before its flags.
+    llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
+    _wait(vmcnt=0)
+    flag = ((RANK * ucap + unit) * 4 + wave) * 4
+    if lane == 0:
+        for j in range_constexpr(1, _A2A_RANKS):
+            _flag_swap(
+                _rsrc(_pick(dests[j], peers) + flags_off, flags_bytes), flag, EPOCH
+            )
+    own = _pick(RANK, peers)
+    flags = _rsrc(own + flags_off, flags_bytes)
+    if tid < 4 * (_A2A_RANKS - 1):
+        peer = (RANK + 1 + (tid >> 2)) & 3
+        while _flag_load(flags, ((peer * ucap + unit) * 4 + (tid & 3)) * 4) < EPOCH:
+            rocdl.s_sleep(1)
+        # Inbox reads stay after the flags (they bypass the caches: sc0 sc1).
+        llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    _stage_end()
+    for j in range_constexpr(1, _A2A_RANKS):
+        sender = (RANK + j) & 3
+        inbox = _rsrc(own + inbox_off + fx.Int64(sender) * fx.Int64(CAP), NB)
+        out = _rsrc(out_base + fx.Int64(sender) * fx.Int64(NB), NB)
+        v = [_load_v4_aux(inbox, o, _AUX_SYS) for o in offs]
+        for i in range_constexpr(_A2A_VECS):
+            _store_v4_aux(v[i], out, offs[i], 0)
+
+
+@flyc.jit
+def launch_a2a(
+    SEND: fx.Tensor,
+    OUT: fx.Tensor,
+    P0: fx.Int64,
+    P1: fx.Int64,
+    P2: fx.Int64,
+    P3: fx.Int64,
+    NB: fx.Int32,
+    CAP: fx.Int32,
+    RANK: fx.Int32,
+    EPOCH: fx.Int32,
+    G: fx.Int32,
+    stream: fx.Stream,
+):
+    _a2a_kernel(SEND, OUT, P0, P1, P2, P3, NB, CAP, RANK, EPOCH).launch(
+        grid=(G, 1, 1), block=(_A2A_THREADS, 1, 1), stream=stream
+    )
+
+
+class _AllToAll:
+    """all_to_all_single with equal blocks on one 4-rank group (shared by every layer): a symmetric
+    buffer for blocks of up to `cap` bytes, allocated on first use."""
+
+    def __init__(self, group, cap: int, device: torch.device):
+        self.cap = -(-cap // _A2A_UNIT) * _A2A_UNIT
+        nbytes = a2a_buffer_bytes(self.cap)
+        self.group, self.epoch = group, 0
+        self.peers = _HipIpcBuffer(group, nbytes, device).addrs
+        logger.info(
+            "PyHIP all-to-all: blocks up to %d bytes, %.0f MiB symmetric buffer",
+            self.cap,
+            nbytes / 2**20,
+        )
+
+    def __call__(self, send: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(send)
+        nb = send.numel() * send.element_size() // _A2A_RANKS
+        if nb == 0:
+            return out
+        self.epoch += 1
+        _run(
+            ("a2a", send.device),
+            launch_a2a,
+            send.view(-1).view(torch.uint8),
+            out.view(-1).view(torch.uint8),
+            *self.peers,
+            nb,
+            self.cap,
+            self.group.rank_in_group,
+            self.epoch,
+            -(-nb // _A2A_UNIT),
+            torch.cuda.current_stream(send.device),
+        )
+        return out
+
+
+_all_to_all: Dict[int, _AllToAll] = {}
+
+
+def all_to_all(send: torch.Tensor, group, cap: int) -> Optional[torch.Tensor]:
+    """all_to_all_single(out, send) of a contiguous tensor (4 equal blocks, 16-byte multiples) on a 4-rank
+    group, bit-exact; None (not run) on other groups or for blocks past `cap` bytes. One symmetric buffer
+    per cap (call site), allocated on first use."""
+    if group.world_size != _A2A_RANKS:
+        return None
+    nbytes = send.numel() * send.element_size()
+    if nbytes % (16 * _A2A_RANKS) or nbytes > _A2A_RANKS * cap:
+        return None
+    a2a = _all_to_all.get(cap)
+    if a2a is None:
+        a2a = _all_to_all[cap] = _AllToAll(group, cap, send.device)
+    assert a2a.group is group
+    return a2a(send.contiguous())

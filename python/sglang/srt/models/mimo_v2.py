@@ -1260,8 +1260,17 @@ class MiMoV2Attention(nn.Module):
             BLOCK_V=triton.next_power_of_2(local_kv_heads * dv),
             HAS_V_SCALE=self.v_scale is not None,
         )
-        received = torch.empty_like(send)
-        group.all_to_all_single(received, send)
+        received = None
+        if envs.SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM.get():
+            from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+            # PyHIP IPC kernel for slices of up to one chunk shard (else RCCL).
+            received = pyhip_fp8_blockscale_moe.all_to_all(
+                send, group, _mimo_sp_moe_max_rows() * row * send.element_size()
+            )
+        if received is None:
+            received = torch.empty_like(send)
+            group.all_to_all_single(received, send)
         received = received.view(attn_tp * rows, row)
         backend = get_attn_backend()
         pool = backend.token_to_kv_pool

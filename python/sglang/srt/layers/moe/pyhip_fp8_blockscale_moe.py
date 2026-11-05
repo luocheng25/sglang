@@ -1541,18 +1541,18 @@ def launch_route_scatter(
 # Rank s owns token rows [off[s], off[s] + size[s]) of the gathered batch (sizes may differ). Every rank holds
 # Y (its I-slice route rows, route weight folded in) and INV [T, 8] (row of route (t, k), -1: none).
 # out (rank s, row u < size[s]) = bf16(sum over ranks in rank order of bf16(sum_k Y[INV[off[s] + u, k]])),
-# sums in FP32. Unit u = row u of every shard. Persistent grid of RS_GRID 512-thread WGs (all resident),
-# units u = block + j * grid below the largest shard; (u, s) with u >= size[s] are skipped.
+# sums in FP32. Unit u = row u of a shard. Persistent grid of RS_GRID 512-thread WGs (all resident, RS_GRID a
+# multiple of 8); WG b serves one destination, s = RANK + 1 + b % 8 (b % 8 == 7: this rank), and its units
+# u = b // 8 + j * RS_GRID / 8 below size[s] (one destination per WG, as in the all-gather below).
 #   RS: waves 0-3 sum the 8 route rows of token (unit u, destination s) and write a quarter row into an LDS
 #      ring; waves 4-5 copy two quarters each to rank s's inbox[parity][rank][u] with write-through stores and,
-#      after a unit, set flag[rank][u][quarter] = epoch on its destinations (monotonic, never reset).
-#      s rotates by block // 8, so the WGs writing to one destination at a time write adjacent rows.
+#      after every 8 units, set flag[rank][u][quarter] = epoch for them (monotonic, never reset).
 #   reduce: wait for this rank's rows' flags, sum the 8 inbox rows in rank order (L2-bypassing loads),
 #      _RS_UNITS units per step.
 # RS never waits on another rank (no deadlock with all WGs resident); a peer is at most one epoch ahead, so
 # the inbox alternates by epoch parity. Destination s's inbox / flag rows are src * size[s] + u.
 
-# Fewer pushing WGs congest xGMI less, more WGs sum faster (32K: 64 / 80 / 96 / 112 -> 1035 / 988 / 1036 / 1168 us).
+# Fewer pushing WGs congest xGMI less, more WGs sum faster (32K: 64 / 80 / 96 -> 961 / 951 / 1003 us).
 RS_GRID = 80
 _RS_THREADS = 512
 _RS_SLOTS = 4  # LDS ring rows
@@ -1743,7 +1743,6 @@ def _sum_rs_kernel(
     S5: fx.Int32,
     S6: fx.Int32,
     S7: fx.Int32,
-    RMAX: fx.Int32,
     RCAP: fx.Int32,
     RANK: fx.Int32,
     EPOCH: fx.Int32,
@@ -1790,17 +1789,21 @@ def _sum_rs_kernel(
     inbox_off = fx.Int64(EPOCH & 1) * fx.Int64(RCAP) * (8 * _ROW)
     flags_off = fx.Int64(RCAP) * (2 * 8 * _ROW)
     flags_bytes = RCAP * (8 * 16)
-    rows = (RMAX - block + G - 1) // G * 8
+    # WG b serves one destination, s = RANK + 1 + b % 8 (the last one is this rank): its units
+    # k, k + G / 8, ... (k = b // 8), in batches of 8 (one flag round per batch).
+    s_dest = (RANK + 1 + (block & 7)) & 7
+    k0 = block >> 3
+    kstep = G >> 3
+    size_dest = _pick(s_dest, sizes)
+    span = (size_dest > k0).select(size_dest - k0, fx.Int32(0))
+    rows = ((span + kstep - 1) // kstep + 7) // 8 * 8
     y_base = fx.Int64(fx.ptrtoint(fx.get_iter(Y)))
     inv_base = fx.Int64(fx.ptrtoint(fx.get_iter(INV)))
     lane_off = (q * _QUARTER + lane) * 16
 
     def dest(seq):
         # seq -> (unit, destination rank, its shard size); valid if u < size
-        u = block + (seq >> 3) * G
-        s = (RANK + (block >> 3) + (seq & 7)) & 7
-        size = _pick(s, sizes)
-        return u, s, size
+        return k0 + seq * kstep, s_dest, size_dest
 
     if tid < 8:
         _counter_store(lds + _RS_SLOTS * _ROW + tid * 4, fx.Int32(0))
@@ -1902,16 +1905,17 @@ def _sum_rs_kernel(
                     llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
                     _wait(vmcnt=0)
                     if lane == 0:
-                        for d in range_constexpr(8):
-                            live = u < sizes[d]
+                        flag_base = _pick(s_dest, peers) + flags_off
+                        for j in range_constexpr(8):
+                            uj = k0 + (seq - 7 + j) * kstep
                             flag_rsrc = _rsrc(
-                                peers[d] + flags_off,
-                                live.select(flags_bytes, fx.Int32(0)),
+                                flag_base,
+                                (uj < size_dest).select(flags_bytes, fx.Int32(0)),
                             )
                             for i in range_constexpr(2):
                                 _flag_swap(
                                     flag_rsrc,
-                                    ((RANK * sizes[d] + u) * 4 + q0 + i) * 4,
+                                    ((RANK * size_dest + uj) * 4 + q0 + i) * 4,
                                     EPOCH,
                                 )
     _stage_end()
@@ -1976,7 +1980,6 @@ def launch_sum_rs(
     S5: fx.Int32,
     S6: fx.Int32,
     S7: fx.Int32,
-    RMAX: fx.Int32,
     RCAP: fx.Int32,
     RANK: fx.Int32,
     EPOCH: fx.Int32,
@@ -2011,7 +2014,6 @@ def launch_sum_rs(
         S5,
         S6,
         S7,
-        RMAX,
         RCAP,
         RANK,
         EPOCH,
@@ -2297,6 +2299,7 @@ class _SumReduceScatter:
         )
 
     def __call__(self, y, inv, sizes: List[int]) -> torch.Tensor:
+        assert RS_GRID % RANKS == 0, "each destination rank gets RS_GRID / 8 push WGs"
         self.epoch += 1
         rank = self.group.rank_in_group
         offsets = [sum(sizes[:i]) for i in range(RANKS)]
@@ -2310,7 +2313,6 @@ class _SumReduceScatter:
             *self.peers,
             *offsets,
             *sizes,
-            max(sizes),
             self.max_rows,
             rank,
             self.epoch,

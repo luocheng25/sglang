@@ -49,6 +49,7 @@ attention-TP exchanges of that layout.
 
 import ctypes
 import logging
+import math
 from typing import Dict, List, Optional
 
 import flydsl.compiler as flyc
@@ -2357,15 +2358,21 @@ def moe_reduce_scatter(
 
 
 # ---- All-to-all on a 4-rank group (HIP IPC), e.g. the SP SWA K/V exchange over attention TP -------------
-# SEND [4 dst][NB bytes] -> OUT [4 src][NB bytes] (all_to_all_single with equal blocks). WG u moves unit u
-# (_A2A_UNIT bytes) of every block: the own block's unit -> OUT, the peers' units -> their inbox[parity][RANK]
-# (write-through). Once its stores are acknowledged, each wave raises flag[RANK][u][wave] to the epoch on the
-# peers (monotonic, never reset); the WG then waits for the peers' 12 flags of unit u and copies their inbox
-# units to OUT (L2-bypassing loads). One unit per WG keeps every store in flight at once. Collectives
-# between two exchanges order the ranks (a peer is at most one exchange ahead): the inbox alternates by parity.
-_A2A_THREADS = 256
-_A2A_VECS = 4  # 16-byte vectors per thread and block
-_A2A_UNIT = _A2A_THREADS * _A2A_VECS * 16
+# SEND [4 dst][NB bytes] -> OUT [4 src][NB bytes] (all_to_all_single with equal blocks), blocks cut into
+# _A2A_UNIT-byte units. Persistent grid of A2A_GRID 8-wave WGs, A2A_GRID / 3 per peer: WG b (p = b % 3,
+# k = b // 3) takes units k, k + A2A_GRID / 3, ...:
+#   push waves 0-3: a unit of block RANK + 1 + p -> that peer's inbox[parity][RANK] (write-through; the p == 0
+#     WGs also copy the own block's unit to OUT); once its stores are acknowledged, wave w raises
+#     flag[RANK][u][w] there (monotonic, never reset).
+#   receive waves 4-7: wave 4 + w waits for flag[s][u][w] of peer s = RANK - 1 - p and copies that quarter of
+#     its inbox unit to OUT (L2-bypassing loads), overlapping the later pushes.
+# One destination per WG and few WGs keep xGMI uncongested (see the all-gather below). Every rank flags and
+# awaits unit 0, so finishing an exchange implies every peer started it, i.e. finished reading the previous
+# one: with the inbox alternating by parity, back-to-back exchanges are safe.
+A2A_GRID = 36
+_A2A_THREADS = 512
+_A2A_VECS = 4  # 16-byte vectors per lane and unit
+_A2A_UNIT = 256 * _A2A_VECS * 16
 _A2A_RANKS = 4
 
 
@@ -2386,6 +2393,7 @@ def _a2a_kernel(
     CAP: fx.Int32,
     RANK: fx.Int32,
     EPOCH: fx.Int32,
+    G: fx.Int32,
 ):
     _helpers = (
         _aux,
@@ -2395,14 +2403,14 @@ def _a2a_kernel(
         _flag_load,
         _flag_swap,
         _pick,
-        _stage_end,
         _uniform,
         _wait,
     )
     peers = [P0, P1, P2, P3]
     tid = fx.Int32(gpu.thread_id("x"))
-    unit = fx.Int32(gpu.block_id("x"))
+    block = fx.Int32(gpu.block_id("x"))
     wave = _uniform(tid >> 6)
+    quarter = wave & 3
     lane = tid & 63
     ucap = CAP // _A2A_UNIT
     inbox_off = fx.Int64(EPOCH & 1) * fx.Int64(CAP) * _A2A_RANKS
@@ -2410,45 +2418,52 @@ def _a2a_kernel(
     flags_bytes = ucap * (_A2A_RANKS * 16)
     send_base = fx.Int64(fx.ptrtoint(fx.get_iter(SEND)))
     out_base = fx.Int64(fx.ptrtoint(fx.get_iter(OUT)))
-    offs = [unit * _A2A_UNIT + (tid + i * _A2A_THREADS) * 16 for i in range(_A2A_VECS)]
-    # Own block first, then the peers rotated by the unit (the WGs spread over the links).
-    turns = [unit + j for j in range(_A2A_RANKS - 1)]
-    dests = [RANK] + [(RANK + 1 + t - t // 3 * 3) & 3 for t in turns]
-    srcs = [_rsrc(send_base + fx.Int64(d) * fx.Int64(NB), NB) for d in dests]
-    data = [[_load_v4_aux(s, o, _AUX_NT) for o in offs] for s in srcs]
-    dsts = [_rsrc(out_base + fx.Int64(RANK) * fx.Int64(NB), NB)] + [
-        _rsrc(_pick(d, peers) + inbox_off + fx.Int64(RANK) * fx.Int64(CAP), NB)
-        for d in dests[1:]
-    ]
-    bits = [0] + [_AUX_SYS_NT] * (_A2A_RANKS - 1)
-    for j in range_constexpr(_A2A_RANKS):
-        for i in range_constexpr(_A2A_VECS):
-            _store_v4_aux(data[j][i], dsts[j], offs[i], bits[j])
-    # This wave's write-through inbox stores are acknowledged before its flags.
-    llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
-    _wait(vmcnt=0)
-    flag = ((RANK * ucap + unit) * 4 + wave) * 4
-    if lane == 0:
-        for j in range_constexpr(1, _A2A_RANKS):
-            _flag_swap(
-                _rsrc(_pick(dests[j], peers) + flags_off, flags_bytes), flag, EPOCH
-            )
+    units = (NB + (_A2A_UNIT - 1)) // _A2A_UNIT
+    # This lane's 16-byte columns of a unit (quarter w: what push wave w writes and receive wave 4 + w reads).
+    offs = [(quarter * 64 + lane) * 16 + i * 4096 for i in range(_A2A_VECS)]
+    p = block - block // 3 * 3
+    k0 = block // 3
+    kstep = G // 3
     own = _pick(RANK, peers)
-    flags = _rsrc(own + flags_off, flags_bytes)
-    if tid < 4 * (_A2A_RANKS - 1):
-        peer = (RANK + 1 + (tid >> 2)) & 3
-        while _flag_load(flags, ((peer * ucap + unit) * 4 + (tid & 3)) * 4) < EPOCH:
-            rocdl.s_sleep(1)
-        # Inbox reads stay after the flags (they bypass the caches: sc0 sc1).
-        llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
-    _stage_end()
-    for j in range_constexpr(1, _A2A_RANKS):
-        sender = (RANK + j) & 3
+    if wave < 4:
+        dest = (RANK + 1 + p) & 3
+        src = _rsrc(send_base + fx.Int64(dest) * fx.Int64(NB), NB)
+        mine = _rsrc(
+            send_base + fx.Int64(RANK) * fx.Int64(NB), (p == 0).select(NB, fx.Int32(0))
+        )
+        own_out = _rsrc(
+            out_base + fx.Int64(RANK) * fx.Int64(NB), (p == 0).select(NB, fx.Int32(0))
+        )
+        inbox_dst = _rsrc(
+            _pick(dest, peers) + inbox_off + fx.Int64(RANK) * fx.Int64(CAP), NB
+        )
+        flag_rsrc = _rsrc(_pick(dest, peers) + flags_off, flags_bytes)
+        for unit in range(k0, units, kstep):
+            base = unit * _A2A_UNIT
+            v = [_load_v4_aux(src, base + o, _AUX_NT) for o in offs]
+            w = [_load_v4_aux(mine, base + o, _AUX_NT) for o in offs]
+            for i in range_constexpr(_A2A_VECS):
+                _store_v4_aux(v[i], inbox_dst, base + offs[i], _AUX_SYS)
+                _store_v4_aux(w[i], own_out, base + offs[i], 0)
+            # This wave's write-through inbox stores are acknowledged before its flag.
+            llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
+            _wait(vmcnt=0)
+            if lane == 0:
+                _flag_swap(flag_rsrc, ((RANK * ucap + unit) * 4 + quarter) * 4, EPOCH)
+    else:
+        sender = (RANK + 3 - p) & 3
+        flags = _rsrc(own + flags_off, flags_bytes)
         inbox = _rsrc(own + inbox_off + fx.Int64(sender) * fx.Int64(CAP), NB)
         out = _rsrc(out_base + fx.Int64(sender) * fx.Int64(NB), NB)
-        v = [_load_v4_aux(inbox, o, _AUX_SYS) for o in offs]
-        for i in range_constexpr(_A2A_VECS):
-            _store_v4_aux(v[i], out, offs[i], 0)
+        for unit in range(k0, units, kstep):
+            while _flag_load(flags, ((sender * ucap + unit) * 4 + quarter) * 4) < EPOCH:
+                rocdl.s_sleep(1)
+            # Inbox reads stay after the flag (they bypass the caches: sc0 sc1).
+            llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+            base = unit * _A2A_UNIT
+            v = [_load_v4_aux(inbox, base + o, _AUX_SYS) for o in offs]
+            for i in range_constexpr(_A2A_VECS):
+                _store_v4_aux(v[i], out, base + offs[i], 0)
 
 
 @flyc.jit
@@ -2466,7 +2481,7 @@ def launch_a2a(
     G: fx.Int32,
     stream: fx.Stream,
 ):
-    _a2a_kernel(SEND, OUT, P0, P1, P2, P3, NB, CAP, RANK, EPOCH).launch(
+    _a2a_kernel(SEND, OUT, P0, P1, P2, P3, NB, CAP, RANK, EPOCH, G).launch(
         grid=(G, 1, 1), block=(_A2A_THREADS, 1, 1), stream=stream
     )
 
@@ -2502,7 +2517,7 @@ class _AllToAll:
             self.cap,
             self.group.rank_in_group,
             self.epoch,
-            -(-nb // _A2A_UNIT),
+            A2A_GRID,
             torch.cuda.current_stream(send.device),
         )
         return out
@@ -2525,3 +2540,353 @@ def all_to_all(send: torch.Tensor, group, cap: int) -> Optional[torch.Tensor]:
         a2a = _all_to_all[cap] = _AllToAll(group, cap, send.device)
     assert a2a.group is group
     return a2a(send.contiguous())
+
+
+# ---- All-gather(v) of 4 row fields on the 8-rank TP group (HIP IPC), e.g. the SP MoE inputs ---------------
+# Rank r holds N_r rows of every field (row_bytes[f] bytes each); output f = the ranks' blocks in rank order
+# (all_gatherv). A sender's fields are cut into _AG_UNIT-byte units, field after field. Persistent grid of
+# AG_GRID 8-wave WGs, AG_GRID / 7 per peer: WG b (p = b % 7, k = b // 7) takes units k, k + AG_GRID / 7, ...
+#   push waves 0-3: a unit of the own fields -> peer RANK + 1 + p's inbox[parity][RANK] (write-through; the
+#     p == 0 WGs also copy it to OUT); once its stores are acknowledged, wave w raises flag[RANK][u][w] there
+#     (monotonic, never reset).
+#   receive waves 4-7: wave 4 + w waits for flag[s][u][w] of peer s = RANK - 1 - p and copies that quarter
+#     of its inbox unit to OUT (L2-bypassing loads), overlapping the later pushes.
+# One destination per WG and few WGs keep xGMI uncongested (8 rows x 4096: 404 us, RCCL 4 all-gathers 537,
+# one packed RCCL all-gather 458). Unit 0 is flagged and awaited for every rank, so finishing an exchange
+# implies every peer started it, i.e. finished reading the previous one: with the inbox alternating by
+# parity, back-to-back exchanges are safe.
+AG_GRID = 56
+_AG_RANKS = 8
+_AG_THREADS = 512
+_AG_VECS = 4
+_AG_UNIT = 256 * _AG_VECS * 16
+
+
+def _ag_units(rows, row_bytes):
+    """Units of each field for `rows` rows."""
+    return [(rows * b + (_AG_UNIT - 1)) // _AG_UNIT for b in row_bytes]
+
+
+def ag_buffer_bytes(cap: int, row_bytes) -> int:
+    """[2 parity][8 src][cap x sum(row_bytes)] inbox + [8 src][units of cap rows][4 waves] int32 flags."""
+    return (
+        2 * _AG_RANKS * cap * sum(row_bytes)
+        + _AG_RANKS * sum(_ag_units(cap, row_bytes)) * 16
+    )
+
+
+def _ag_field(unit, counts):
+    """(field, unit within the field) of a sender's unit, given the field unit counts."""
+    starts = [fx.Int32(0)]
+    for c in counts[:-1]:
+        starts.append(starts[-1] + c)
+    field = fx.Int32(0)
+    for f in range(1, len(counts)):
+        field = field + (unit >= starts[f]).select(fx.Int32(1), fx.Int32(0))
+    return field, unit - _pick(field, starts)
+
+
+@flyc.kernel(known_block_size=[_AG_THREADS, 1, 1])
+def _ag_kernel(
+    S0: fx.Tensor,
+    S1: fx.Tensor,
+    S2: fx.Tensor,
+    S3: fx.Tensor,
+    O0: fx.Tensor,
+    O1: fx.Tensor,
+    O2: fx.Tensor,
+    O3: fx.Tensor,
+    P0: fx.Int64,
+    P1: fx.Int64,
+    P2: fx.Int64,
+    P3: fx.Int64,
+    P4: fx.Int64,
+    P5: fx.Int64,
+    P6: fx.Int64,
+    P7: fx.Int64,
+    N0: fx.Int32,
+    N1: fx.Int32,
+    N2: fx.Int32,
+    N3: fx.Int32,
+    N4: fx.Int32,
+    N5: fx.Int32,
+    N6: fx.Int32,
+    N7: fx.Int32,
+    F0: fx.Int32,
+    F1: fx.Int32,
+    F2: fx.Int32,
+    F3: fx.Int32,
+    F4: fx.Int32,
+    F5: fx.Int32,
+    F6: fx.Int32,
+    F7: fx.Int32,
+    B0: fx.Int32,
+    B1: fx.Int32,
+    B2: fx.Int32,
+    B3: fx.Int32,
+    CAP: fx.Int32,
+    RANK: fx.Int32,
+    EPOCH: fx.Int32,
+    G: fx.Int32,
+):
+    _helpers = (
+        _ag_units,
+        _ag_field,
+        _aux,
+        _rsrc,
+        _load_v4_aux,
+        _store_v4_aux,
+        _flag_load,
+        _flag_swap,
+        _pick,
+        _uniform,
+        _wait,
+    )
+    peers = [P0, P1, P2, P3, P4, P5, P6, P7]
+    rows = [N0, N1, N2, N3, N4, N5, N6, N7]
+    firsts = [F0, F1, F2, F3, F4, F5, F6, F7]
+    row_bytes = [B0, B1, B2, B3]
+    srcs = [fx.Int64(fx.ptrtoint(fx.get_iter(t))) for t in (S0, S1, S2, S3)]
+    outs = [fx.Int64(fx.ptrtoint(fx.get_iter(t))) for t in (O0, O1, O2, O3)]
+    tid = fx.Int32(gpu.thread_id("x"))
+    block = fx.Int32(gpu.block_id("x"))
+    wave = _uniform(tid >> 6)
+    quarter = wave & 3
+    lane = tid & 63
+    # Inbox slot of one sender: its fields at cap-row offsets.
+    cap64 = fx.Int64(CAP)
+    field_offs = [
+        fx.Int64(0),
+        cap64 * fx.Int64(B0),
+        cap64 * fx.Int64(B0 + B1),
+        cap64 * fx.Int64(B0 + B1 + B2),
+    ]
+    slot = cap64 * fx.Int64(B0 + B1 + B2 + B3)
+    inbox_off = fx.Int64(EPOCH & 1) * slot * _AG_RANKS
+    flags_off = slot * (2 * _AG_RANKS)
+    caps = _ag_units(CAP, row_bytes)
+    ucap = caps[0] + caps[1] + caps[2] + caps[3]
+    flags_bytes = ucap * (_AG_RANKS * 16)
+    # This lane's 16-byte columns of a unit (quarter w: what push wave w writes and receive wave 4 + w reads).
+    offs = [(quarter * 64 + lane) * 16 + i * 4096 for i in range(_AG_VECS)]
+    counts = [_ag_units(n, row_bytes) for n in rows]
+    units = [c[0] + c[1] + c[2] + c[3] for c in counts]
+    # Unit 0 counts for every rank (see above).
+    steps = [(n > 0).select(n, fx.Int32(1)) for n in units]
+
+    def locate(r, unit):
+        # Rank r's unit: (field, byte offset in the field, field bytes; 0 past the last unit).
+        field, local = _ag_field(unit, _ag_units(_pick(r, rows), row_bytes))
+        nbytes = (unit < _pick(r, units)).select(
+            _pick(r, rows) * _pick(field, row_bytes), fx.Int32(0)
+        )
+        return field, local * _AG_UNIT, nbytes
+
+    def out_rsrc(r, field, nbytes):
+        first = fx.Int64(_pick(r, firsts)) * fx.Int64(_pick(field, row_bytes))
+        return _rsrc(_pick(field, outs) + first, nbytes)
+
+    own = _pick(RANK, peers)
+    # WG b serves one peer: it pushes units k, k + K, ... to peer RANK + 1 + p and receives them from peer
+    # RANK - 1 - p (p = b % 7, k = b // 7, K = G // 7); the p == 0 WGs also copy the own rows to OUT.
+    p = block - block // 7 * 7
+    k0 = block // 7
+    kstep = G // 7
+    if wave < 4:
+        dest = (RANK + 1 + p) & 7
+        dst_base = _pick(dest, peers) + inbox_off + fx.Int64(RANK) * slot
+        flag_rsrc = _rsrc(_pick(dest, peers) + flags_off, flags_bytes)
+        for unit in range(k0, _pick(RANK, steps), kstep):
+            field, base, nbytes = locate(RANK, unit)
+            src = _rsrc(_pick(field, srcs), nbytes)
+            v = [_load_v4_aux(src, base + o, _AUX_NT) for o in offs]
+            own_out = out_rsrc(RANK, field, (p == 0).select(nbytes, fx.Int32(0)))
+            inbox_dst = _rsrc(dst_base + _pick(field, field_offs), nbytes)
+            for i in range_constexpr(_AG_VECS):
+                _store_v4_aux(v[i], own_out, base + offs[i], 0)
+                _store_v4_aux(v[i], inbox_dst, base + offs[i], _AUX_SYS)
+            # This wave's write-through inbox stores are acknowledged before its flag.
+            llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
+            _wait(vmcnt=0)
+            if lane == 0:
+                _flag_swap(flag_rsrc, ((RANK * ucap + unit) * 4 + quarter) * 4, EPOCH)
+    else:
+        sender = (RANK + 7 - p) & 7
+        flags = _rsrc(own + flags_off, flags_bytes)
+        src_base = own + inbox_off + fx.Int64(sender) * slot
+        for unit in range(k0, _pick(sender, steps), kstep):
+            flag = ((sender * ucap + unit) * 4 + quarter) * 4
+            while _flag_load(flags, flag) < EPOCH:
+                rocdl.s_sleep(1)
+            # Inbox reads stay after the flag (they bypass the caches: sc0 sc1).
+            llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+            field, base, nbytes = locate(sender, unit)
+            inbox = _rsrc(src_base + _pick(field, field_offs), nbytes)
+            out = out_rsrc(sender, field, nbytes)
+            w = [_load_v4_aux(inbox, base + o, _AUX_SYS) for o in offs]
+            for i in range_constexpr(_AG_VECS):
+                _store_v4_aux(w[i], out, base + offs[i], 0)
+
+
+@flyc.jit
+def launch_ag(
+    S0: fx.Tensor,
+    S1: fx.Tensor,
+    S2: fx.Tensor,
+    S3: fx.Tensor,
+    O0: fx.Tensor,
+    O1: fx.Tensor,
+    O2: fx.Tensor,
+    O3: fx.Tensor,
+    P0: fx.Int64,
+    P1: fx.Int64,
+    P2: fx.Int64,
+    P3: fx.Int64,
+    P4: fx.Int64,
+    P5: fx.Int64,
+    P6: fx.Int64,
+    P7: fx.Int64,
+    N0: fx.Int32,
+    N1: fx.Int32,
+    N2: fx.Int32,
+    N3: fx.Int32,
+    N4: fx.Int32,
+    N5: fx.Int32,
+    N6: fx.Int32,
+    N7: fx.Int32,
+    F0: fx.Int32,
+    F1: fx.Int32,
+    F2: fx.Int32,
+    F3: fx.Int32,
+    F4: fx.Int32,
+    F5: fx.Int32,
+    F6: fx.Int32,
+    F7: fx.Int32,
+    B0: fx.Int32,
+    B1: fx.Int32,
+    B2: fx.Int32,
+    B3: fx.Int32,
+    CAP: fx.Int32,
+    RANK: fx.Int32,
+    EPOCH: fx.Int32,
+    G: fx.Int32,
+    stream: fx.Stream,
+):
+    _ag_kernel(
+        S0,
+        S1,
+        S2,
+        S3,
+        O0,
+        O1,
+        O2,
+        O3,
+        P0,
+        P1,
+        P2,
+        P3,
+        P4,
+        P5,
+        P6,
+        P7,
+        N0,
+        N1,
+        N2,
+        N3,
+        N4,
+        N5,
+        N6,
+        N7,
+        F0,
+        F1,
+        F2,
+        F3,
+        F4,
+        F5,
+        F6,
+        F7,
+        B0,
+        B1,
+        B2,
+        B3,
+        CAP,
+        RANK,
+        EPOCH,
+        G,
+    ).launch(grid=(G, 1, 1), block=(_AG_THREADS, 1, 1), stream=stream)
+
+
+def _row_bytes(tensor: torch.Tensor) -> int:
+    return math.prod(tensor.shape[1:]) * tensor.element_size()
+
+
+def _flat_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    """The bytes of a contiguous or transposed (column-major) 2-D tensor in memory order."""
+    if not tensor.is_contiguous():
+        tensor = tensor.t()
+    return tensor.contiguous().view(-1).view(torch.uint8)
+
+
+class _AllGatherV:
+    """all_gatherv of 4 row fields on one 8-rank group (shared by every layer): a symmetric buffer for up to
+    `cap` rows per rank, allocated on first use."""
+
+    def __init__(self, group, cap: int, row_bytes, device: torch.device):
+        nbytes = ag_buffer_bytes(cap, row_bytes)
+        self.group, self.cap, self.row_bytes, self.epoch = group, cap, row_bytes, 0
+        self.peers = _HipIpcBuffer(group, nbytes, device).addrs
+        logger.info(
+            "PyHIP all-gather: up to %d rows per rank, %.0f MiB symmetric buffer",
+            cap,
+            nbytes / 2**20,
+        )
+
+    def __call__(self, tensors: List[torch.Tensor], sizes: List[int]):
+        self.epoch += 1
+        device = tensors[0].device
+        outs = [t.new_empty((sum(sizes), *t.shape[1:])) for t in tensors]
+        firsts = [sum(sizes[:r]) for r in range(_AG_RANKS)]
+        _run(
+            ("ag", device),
+            launch_ag,
+            *[_flat_bytes(t) for t in tensors],
+            *[o.view(-1).view(torch.uint8) for o in outs],
+            *self.peers,
+            *sizes,
+            *firsts,
+            *self.row_bytes,
+            self.cap,
+            self.group.rank_in_group,
+            self.epoch,
+            AG_GRID,
+            torch.cuda.current_stream(device),
+        )
+        return outs
+
+
+_all_gatherv: Dict[tuple, _AllGatherV] = {}
+
+
+def all_gatherv(
+    tensors: List[torch.Tensor], sizes: List[int], group, cap: int
+) -> Optional[List[torch.Tensor]]:
+    """GroupCoordinator.all_gatherv of 4 tensors (rows = sizes[rank]; row bytes 16-byte multiples;
+    contiguous or transposed 2-D) on an 8-rank group, bit-exact; None (not run) on other groups or
+    for more than `cap` rows per rank. One symmetric buffer per (cap, row bytes), allocated on first use.
+    """
+    row_bytes = tuple(_row_bytes(t) for t in tensors)
+    if (
+        group.world_size != _AG_RANKS
+        or len(tensors) != 4
+        or max(sizes) > cap
+        or sum(sizes) == 0
+        or any(b % 16 for b in row_bytes)
+    ):
+        return None
+    ag = _all_gatherv.get((cap, row_bytes))
+    if ag is None:
+        ag = _all_gatherv[(cap, row_bytes)] = _AllGatherV(
+            group, cap, row_bytes, tensors[0].device
+        )
+    assert ag.group is group
+    return ag(tensors, sizes)

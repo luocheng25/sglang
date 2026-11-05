@@ -229,10 +229,29 @@ def _mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_metho
     attn_tp = get_attention_tp_size()
     rows = attn_output.shape[0] // attn_tp
     assert rows * attn_tp == attn_output.shape[0]
-    received = torch.empty_like(attn_output)
-    get_attention_tp_group().all_to_all_single(received, attn_output.contiguous())
+    received = _mimo_attn_tp_all_to_all(
+        attn_output.contiguous(), attn_output.shape[1] * attn_output.element_size()
+    )
     x = received.view(attn_tp, rows, -1).transpose(0, 1).reshape(rows, -1)
     return quant_method.apply(SimpleNamespace(weight=weight), x)
+
+
+def _mimo_attn_tp_all_to_all(send: torch.Tensor, row_bytes: int) -> torch.Tensor:
+    """all_to_all_single over attention TP (equal blocks along dim 0); the PyHIP IPC kernel
+    (SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM) for blocks of up to one chunk shard of `row_bytes` rows.
+    """
+    group = get_attention_tp_group()
+    if envs.SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM.get():
+        from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+        received = pyhip_fp8_blockscale_moe.all_to_all(
+            send, group, _mimo_sp_moe_max_rows() * row_bytes
+        )
+        if received is not None:
+            return received
+    received = torch.empty_like(send)
+    group.all_to_all_single(received, send)
+    return received
 
 
 _SP_SWA_PAGE = 64
@@ -828,15 +847,22 @@ class MiMoV2MoE(nn.Module):
         if sum(sizes) == 0:
             return router_hidden_states
         tp_group = get_tp_group()
-        topk_weights, topk_ids, quantized_bytes, scale = tp_group.all_gatherv(
-            [
-                topk_output.topk_weights.to(torch.float32),
-                topk_output.topk_ids.to(torch.int32),
-                quantized.view(torch.uint8),
-                scale,
-            ],
-            sizes=sizes,
-        )
+        fields = [
+            topk_output.topk_weights.to(torch.float32),
+            topk_output.topk_ids.to(torch.int32),
+            quantized.view(torch.uint8),
+            scale,
+        ]
+        gathered = None
+        if self._use_pyhip_moe(sizes):
+            from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+            gathered = pyhip_fp8_blockscale_moe.all_gatherv(
+                fields, sizes, tp_group, _mimo_sp_moe_max_rows()
+            )
+        if gathered is None:
+            gathered = tp_group.all_gatherv(fields, sizes=sizes)
+        topk_weights, topk_ids, quantized_bytes, scale = gathered
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
@@ -1221,7 +1247,6 @@ class MiMoV2Attention(nn.Module):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         attn_tp, rank = get_attention_tp_size(), get_attention_tp_rank()
-        group = get_attention_tp_group()
         rows = _mimo_hidden_num_tokens(hidden_states)
         heads, kv_heads = self.total_num_heads, self.total_num_kv_heads
         dq, dv = self.head_dim, self.original_v_head_dim
@@ -1260,17 +1285,7 @@ class MiMoV2Attention(nn.Module):
             BLOCK_V=triton.next_power_of_2(local_kv_heads * dv),
             HAS_V_SCALE=self.v_scale is not None,
         )
-        received = None
-        if envs.SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM.get():
-            from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
-
-            # PyHIP IPC kernel for slices of up to one chunk shard (else RCCL).
-            received = pyhip_fp8_blockscale_moe.all_to_all(
-                send, group, _mimo_sp_moe_max_rows() * row * send.element_size()
-            )
-        if received is None:
-            received = torch.empty_like(send)
-            group.all_to_all_single(received, send)
+        received = _mimo_attn_tp_all_to_all(send, row * send.element_size())
         received = received.view(attn_tp * rows, row)
         backend = get_attn_backend()
         pool = backend.token_to_kv_pool

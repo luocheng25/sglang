@@ -19,6 +19,7 @@ from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
@@ -127,6 +128,7 @@ if _use_aiter:
         mimo_rmsnorm_fp8_group_quant as _aiter_mimo_rmsnorm_fp8_group_quant,
     )
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
+
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_fused_rms_qkv_quant_supported:
@@ -867,7 +869,10 @@ class LayerCommunicator:
             quant_format == "fp8_moe"
             and _use_aiter
             and _is_fused_rms_moe_quant_supported
-            and self._context.attn_dp_size == 1
+            and (
+                self._context.attn_dp_size == 1
+                or self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED
+            )
             and get_moe_cp_size() == 1
         ):
             # This adapter intentionally has no forward_with_allreduce_fusion

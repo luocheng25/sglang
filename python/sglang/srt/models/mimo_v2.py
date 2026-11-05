@@ -1661,6 +1661,12 @@ class MiMoV2DecoderLayer(nn.Module):
             else ""
         )
 
+    def _moe_quant_format(self, communicator, forward_batch: ForwardBatch) -> str:
+        # The SP MoE takes the FP8 rows and scales of its own token shard.
+        if communicator is not self.layer_communicator:
+            return self._fused_rms_moe_quant_format
+        return self._prefill_moe_quant_format(forward_batch)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1722,14 +1728,14 @@ class MiMoV2DecoderLayer(nn.Module):
             hidden_states, residual = communicator.prepare_mlp_from_scattered_attn(
                 hidden_states,
                 residual,
-                quant_format=self._prefill_moe_quant_format(forward_batch),
+                quant_format=self._moe_quant_format(communicator, forward_batch),
             )
         else:
             hidden_states, residual = communicator.prepare_mlp(
                 hidden_states,
                 residual,
                 forward_batch,
-                quant_format=self._prefill_moe_quant_format(forward_batch),
+                quant_format=self._moe_quant_format(communicator, forward_batch),
             )
 
         should_allreduce_fusion = (

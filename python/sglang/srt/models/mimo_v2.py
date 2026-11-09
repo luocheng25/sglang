@@ -497,7 +497,16 @@ class MiMoV2MoE(nn.Module):
         if self._sp_tp_moe and not getattr(
             self.experts.quant_method, "convert_mxfp4_to_fp8", False
         ):
-            raise ValueError("MiMo TP prefill SP requires static MXFP4-to-FP8 experts")
+            from sglang.srt.layers.quantization.mxfp4_aiter_a16w4_moe import (
+                Mxfp4AiterA16W4MoEMethod,
+            )
+
+            if not (
+                envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+                and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+                and isinstance(self.experts.quant_method, Mxfp4AiterA16W4MoEMethod)
+            ):
+                raise ValueError("MiMo SP requires static FP8 or the opted-in native MXFP4 graph path")
 
     def get_moe_weights(self):
         return [
@@ -823,18 +832,29 @@ class MiMoV2Attention(nn.Module):
                     torch.empty(self.total_num_heads, dtype=torch.float32),
                     requires_grad=False,
                 )
+        # DFlash graph verification projects every layer's attention output on token shards.
+        self._graph_sp_o_proj = (
+            envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+            and not self._ep_sp_swa
+            and mimo_tp_sp_enabled()
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+        )
 
     def build_sp_weights(self):
         """Assemble full-head weights from the attention-TP shards (after load_weights)."""
         from sglang.srt.layers.attention.mimo_sp import _mimo_attn_tp_gather
 
-        if self._ep_sp_swa or self.qkv_proj_full is None:
+        if self._ep_sp_swa or (
+            self.qkv_proj_full is None and not getattr(self, "_graph_sp_o_proj", False)
+        ):
             return
         if isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
             shard = self.o_proj.weight.data
             self.o_proj_full = (
                 _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
             )
+        if self.qkv_proj_full is None:
+            return
         if self.attention_sink_bias is not None:
             self.attention_sink_full = _mimo_attn_tp_gather(
                 self.attention_sink_bias.data
@@ -906,6 +926,7 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        scatter_output: bool = False,
         sp_swa: bool = False,
     ) -> torch.Tensor:
         if sp_swa:
@@ -934,6 +955,12 @@ class MiMoV2Attention(nn.Module):
                 ..., : self.original_v_head_dim
             ].reshape(-1, self.num_heads * self.original_v_head_dim)
 
+        if scatter_output:
+            from sglang.srt.layers.attention.mimo_sp import mimo_sp_o_proj
+
+            return mimo_sp_o_proj(
+                attn_output, self.o_proj_full, self.o_proj.quant_method
+            )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1193,7 +1220,7 @@ class MiMoV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
-        sp_swa = False
+        sp_o_proj = sp_swa = False
         if self.layer_communicator_sp is not None and mimo_tp_sp_active(forward_batch):
             communicator = self.layer_communicator_sp
             if (
@@ -1205,6 +1232,13 @@ class MiMoV2DecoderLayer(nn.Module):
             ):
                 communicator = self.layer_communicator_sp_attn
                 sp_swa = True
+            elif forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+                # Only graph verification selects SP in this mode (mimo_tp_sp_active).
+                sp_o_proj = (
+                    self.self_attn.o_proj_full is not None
+                    and communicator.layer_scatter_modes.mlp_mode
+                    == ScatterMode.SCATTERED
+                )
         elif (
             self.self_attn._ep_sp_swa
             and self.layer_communicator_sp_attn is not None
@@ -1229,15 +1263,23 @@ class MiMoV2DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                scatter_output=sp_o_proj,
                 sp_swa=sp_swa,
             )
 
-        hidden_states, residual = communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format=self._prefill_moe_quant_format(forward_batch),
-        )
+        if sp_o_proj:
+            hidden_states, residual = communicator.prepare_mlp_from_scattered_attn(
+                hidden_states,
+                residual,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
+        else:
+            hidden_states, residual = communicator.prepare_mlp(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
 
         should_allreduce_fusion = (
             communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)

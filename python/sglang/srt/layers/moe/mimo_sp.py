@@ -35,6 +35,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend, should_use_dpa_sp_moe
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.mimo_v2_utils import mimo_flydsl_target_verify_enabled
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_gfx942_supported
@@ -80,13 +81,57 @@ def _log_mimo_prefill_pyhip_moe():
     logger.info("Using PR40 PyHIP FP8 prefill MoE with fused reduce-scatter")
 
 
-def mimo_tp_sp_active(forward_batch: Optional[ForwardBatch]) -> bool:
-    """Use the SGLANG_ENABLE_MIMO_SWA_SP layout for this forward: the same decision on every rank
-    and layer (global token count); small passes and graph capture keep the all-reduce path.
+@functools.lru_cache(maxsize=1)
+def _log_mimo_graph_verify_sp():
+    storage = "static FP8" if envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get() else "native MXFP4"
+    logger.info("Using MiMo DFlash8 target graph sequence parallel (TP8/DP2/EP1, %s)", storage)
+
+
+def _mimo_graph_verify_sp_active(forward_batch: ForwardBatch) -> bool:
+    """Select SP only while warming/capturing a uniform DFlash8 target graph.
+
+    Decode graph construction gives every rank the same TARGET_VERIFY mode and
+    padded token counts, including graphs later replayed with an idle replica.
+    Eager/mixed batches keep the original path; no runtime-local decision may
+    change the collective sequence recorded in a graph.
     """
     if (
-        forward_batch is None
-        or not forward_batch.all_extend_in_batch
+        not envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+        or not get_is_capture_mode()
+        or forward_batch.forward_mode != ForwardMode.TARGET_VERIFY
+        or forward_batch.global_forward_mode != ForwardMode.TARGET_VERIFY
+        or forward_batch.can_run_tbo
+        or forward_batch.all_extend_in_batch
+        or forward_batch.spec_algorithm is None
+        or not forward_batch.spec_algorithm.is_dflash()
+        or getattr(forward_batch.spec_info, "draft_token_num", None) != 8
+        or forward_batch.dp_padding_mode is None
+        or not forward_batch.dp_padding_mode.is_max_len()
+    ):
+        return False
+    sizes = get_dp_global_num_tokens()
+    return (
+        sizes is not None
+        and len(sizes) == 2
+        and sizes[0] == sizes[1] == forward_batch.batch_size * 8
+        and sum(sizes) >= _MIMO_SP_MIN_TOKENS
+    )
+
+
+def mimo_tp_sp_active(forward_batch: Optional[ForwardBatch]) -> bool:
+    """Use the SGLANG_ENABLE_MIMO_SWA_SP layout for this forward: the same decision on every rank
+    and layer (global token count). Graph verification has a separate opt-in gate.
+    """
+    if forward_batch is None:
+        return False
+    if _mimo_graph_verify_sp_active(forward_batch):
+        _log_mimo_graph_verify_sp()
+        return True
+    # The native expert path is qualified separately for uniform graphs only.
+    if not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get():
+        return False
+    if (
+        not forward_batch.all_extend_in_batch
         or forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.IDLE)
         or forward_batch.can_run_tbo
         or torch.cuda.is_current_stream_capturing()
@@ -146,7 +191,10 @@ def mimo_tp_sp_enabled() -> bool:
     args = get_global_server_args()
     return (
         is_gfx942_supported()
-        and envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+        and (
+            envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+            or envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+        )
         and envs.SGLANG_FLYPA_MIMO_PREFILL.get()
         and mimo_flydsl_target_verify_enabled()
         and (get_moe_runner_backend().is_aiter() or get_moe_runner_backend().is_auto())
@@ -169,6 +217,8 @@ def run_mimo_tp_sp_moe(layer, hidden_states) -> torch.Tensor:
     the TP group, run the TP-sharded experts on all tokens, then reduce-scatter the
     partial sums back to the shard. Same quantized expert input as the all-reduce path.
     """
+    if not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get():
+        return run_mimo_tp_sp_moe_native(layer, hidden_states)
     router_hidden_states, expert_hidden_states = split_mimo_moe_inputs(hidden_states)
     if router_hidden_states.shape[0] > 0:
         router_logits = layer.gate(router_hidden_states)
@@ -211,7 +261,9 @@ def run_mimo_tp_sp_moe(layer, hidden_states) -> torch.Tensor:
         quantized_bytes.view(quantized.dtype),
         _mimo_sp_moe_gather_scales(scale, sizes),
     )
-    if _use_pyhip_moe(layer, sizes):
+    capturing = get_is_capture_mode() or torch.cuda.is_current_stream_capturing()
+    # The PyHIP fused reduction is qualified for prefill shards, not graph capture.
+    if not capturing and _use_pyhip_moe(layer, sizes):
         _log_mimo_prefill_pyhip_moe()
         from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
 
@@ -230,9 +282,45 @@ def run_mimo_tp_sp_moe(layer, hidden_states) -> torch.Tensor:
     final_hidden_states = layer.experts(expert_input, topk_output)
     if all(size == sizes[0] for size in sizes):
         output = final_hidden_states.new_empty((sizes[0], final_hidden_states.shape[1]))
-        tp_group.reduce_scatter_tensor(output, final_hidden_states)
+        if capturing:
+            with tp_group.pynccl_comm.change_state(enable=True):
+                tp_group.pynccl_comm.reduce_scatter(output, final_hidden_states)
+        else:
+            tp_group.reduce_scatter_tensor(output, final_hidden_states)
         return output
     return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
+
+
+def run_mimo_tp_sp_moe_native(layer, hidden_states) -> torch.Tensor:
+    """Native MXFP4 graph path: gather BF16 before the existing row quantizer.
+
+    Native A8W4 uses one activation scale per row, unlike FP8 MoE's
+    per-128-column scales. Preserve its exact input contract and let the
+    unchanged native expert implementation quantize the gathered rows.
+    """
+    assert isinstance(hidden_states, torch.Tensor)
+    assert hidden_states.dtype == torch.bfloat16
+    sizes = _mimo_sp_moe_sizes()
+    assert sizes and all(size == sizes[0] for size in sizes)
+    assert hidden_states.shape[0] == sizes[0] > 0
+    topk = layer.topk(hidden_states, layer.gate(hidden_states))
+    tp_group = get_tp_group()
+    weights, ids, gathered = tp_group.all_gatherv(
+        [topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32), hidden_states],
+        sizes=sizes,
+    )
+    partial = layer.experts(gathered, StandardTopKOutput(
+        topk_weights=weights,
+        topk_ids=ids,
+        router_logits=weights.new_empty((0,)),
+    ))
+    output = partial.new_empty((sizes[0], partial.shape[1]))
+    comm = tp_group.pynccl_comm
+    if comm is None or not comm.available:
+        raise RuntimeError("MiMo native graph SP requires the direct RCCL communicator")
+    with comm.change_state(enable=True):
+        comm.reduce_scatter(output, partial)
+    return output
 
 
 def _use_pyhip_moe(layer, sizes: List[int]) -> bool:

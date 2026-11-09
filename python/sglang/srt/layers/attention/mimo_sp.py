@@ -567,12 +567,38 @@ def _run_mimo_tp_sp_swa(
             softmax_scale=self.scaling,
             stream=torch.cuda.current_stream(q.device),
         )
-    return self.o_proj.quant_method.apply(
-        SimpleNamespace(weight=self.o_proj_full), out.view(rows, heads * dv)
+    return _mimo_full_o_proj(
+        out.view(rows, heads * dv),
+        self.o_proj_full,
+        self.o_proj.quant_method,
+        getattr(self, "o_proj_full_packed", False),
     )
 
 
-def mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method):
+@lru_cache(maxsize=None)
+def mimo_init_hipblaslt(device):
+    import aiter
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Initialize MiMo HIPBLASLt before graph capture")
+    with torch.cuda.device(device):
+        aiter.hipb_create_extension()
+
+
+def _mimo_full_o_proj(states, weight, quant_method, packed=False):
+    if not packed:
+        return quant_method.apply(SimpleNamespace(weight=weight), states)
+    import aiter
+
+    assert states.dtype == weight.dtype == torch.bfloat16
+    if states.shape[0] == 0:
+        return states.new_empty((0, weight.shape[0]))
+    mimo_init_hipblaslt(states.device)
+    return aiter.hipb_mm(states, weight.t(), solution_index=-1, bias=None,
+                        out_dtype=torch.bfloat16, bpreshuffle=True)
+
+
+def mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method, packed=False):
     """o_proj for this rank's token slice: all-to-all over attention TP
     gives every rank its token slice of all head groups, then one GEMM with the full weight.
     """
@@ -602,7 +628,7 @@ def mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method
     else:
         group.all_to_all_single(received, source)
     x = received.view(attn_tp, rows, -1).transpose(0, 1).reshape(rows, -1)
-    return quant_method.apply(SimpleNamespace(weight=weight), x)
+    return _mimo_full_o_proj(x, weight, quant_method, packed)
 
 
 def run_mimo_sp_swa(

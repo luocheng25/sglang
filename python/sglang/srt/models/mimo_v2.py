@@ -817,6 +817,7 @@ class MiMoV2Attention(nn.Module):
         )
         # Full-head SWA output-projection and sink weights.
         self.o_proj_full: Optional[torch.Tensor] = None
+        self.o_proj_full_packed = False
         self.attention_sink_full: Optional[torch.Tensor] = None
         if self._ep_sp_swa and self.qkv_proj_full is not None:
             # Preserve upstream PR43's direct checkpoint loading for EP SWA.
@@ -839,6 +840,11 @@ class MiMoV2Attention(nn.Module):
             and mimo_tp_sp_enabled()
             and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
         )
+        self._pack_sp_o_proj = (
+            envs.SGLANG_MIMO_SP_PACKED_OPROJ.get()
+            and mimo_tp_sp_enabled()
+            and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+        )
 
     def build_sp_weights(self):
         """Assemble full-head weights from the attention-TP shards (after load_weights)."""
@@ -853,6 +859,20 @@ class MiMoV2Attention(nn.Module):
             self.o_proj_full = (
                 _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
             )
+            self.o_proj_full_packed = False
+            if getattr(self, "_pack_sp_o_proj", False):
+                if self.o_proj_full.dtype != torch.bfloat16 or self.o_proj_full.shape != (4096, 8192):
+                    raise ValueError("Packed MiMo SP projection requires BF16 [4096, 8192] weights")
+                from aiter.ops.shuffle import shuffle_weight
+
+                from sglang.srt.layers.attention.mimo_sp import mimo_init_hipblaslt
+
+                mimo_init_hipblaslt(self.o_proj_full.device)
+                # Replace the full-weight layout, keeping the local shard for
+                # ordinary attention. Do not retain a second full-weight copy.
+                self.o_proj_full = shuffle_weight(self.o_proj_full, layout=(16, 16), use_int4=False)
+                self.o_proj_full_packed = True
+                logger.info("Using packed BF16 MiMo SP output projection")
         if self.qkv_proj_full is None:
             return
         if self.attention_sink_bias is not None:
@@ -959,7 +979,10 @@ class MiMoV2Attention(nn.Module):
             from sglang.srt.layers.attention.mimo_sp import mimo_sp_o_proj
 
             return mimo_sp_o_proj(
-                attn_output, self.o_proj_full, self.o_proj.quant_method
+                attn_output,
+                self.o_proj_full,
+                self.o_proj.quant_method,
+                getattr(self, "o_proj_full_packed", False),
             )
         output, _ = self.o_proj(attn_output)
         return output

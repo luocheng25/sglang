@@ -101,6 +101,13 @@ export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
 export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-96}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
+# Decode opt-ins measured on the standard decode matrix (set 0 to disable):
+# fused DP pad/copy, one PA plan for the target SWA layers, MQ request
+# broadcast, DFlash CPU staging through NumPy views.
+export SGLANG_DPA_FUSED_PAD_COPY="${SGLANG_DPA_FUSED_PAD_COPY:-1}"
+export SGLANG_MIMO_GROUPED_PA_SWA="${SGLANG_MIMO_GROUPED_PA_SWA:-1}"
+export SGLANG_SCHEDULER_MQ_BROADCAST="${SGLANG_SCHEDULER_MQ_BROADCAST:-1}"
+export SGLANG_DFLASH_FAST_CPU_STAGING="${SGLANG_DFLASH_FAST_CPU_STAGING:-1}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 # DPA divides both limits by DP2: 16K prefill and 96 requests/group.
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-192}"
@@ -216,6 +223,7 @@ echo "Per-DP limits: requests=$((MAX_RUNNING_REQUESTS / 2)), chunked-prefill=$((
 echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}, qlen1=${SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-max-bs=${CUDA_GRAPH_MAX_BS_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}"
 echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/${SGLANG_AITER_DFLASH_SWA_IMPL}, draft-kv=bf16, draft-window=1024, acceptance=simulated"
 echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; compact draft table=${SGLANG_DFLASH_FUSED_COMPACT_KV}; fused bounds checks=${SGLANG_FUSED_ASYNC_OOB_CHECKS}; fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}; fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}"
+echo "Decode: fused DP pad copy=${SGLANG_DPA_FUSED_PAD_COPY}; grouped PA SWA=${SGLANG_MIMO_GROUPED_PA_SWA}; MQ broadcast=${SGLANG_SCHEDULER_MQ_BROADCAST}; DFlash fast CPU staging=${SGLANG_DFLASH_FAST_CPU_STAGING}; ROCm 7.0 SUM_LEN graph workaround=${SGLANG_USE_ROCM700A:-unset}"
 echo "Simulated acceptance: expected bonus-inclusive length=${SGLANG_SIMULATE_ACC_LEN}, method=${SGLANG_SIMULATE_ACC_METHOD} (throughput only)"
 echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
 echo "Decode: preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, log-interval=${DECODE_LOG_INTERVAL}, watchdog=${WATCHDOG_TIMEOUT}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}"

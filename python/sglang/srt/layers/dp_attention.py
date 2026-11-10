@@ -475,6 +475,7 @@ def _pad_copy_triton_kernel(
     dst_ptr, src_ptr, offset_ptr, size_ptr,
     GLOBAL_SIZE: tl.constexpr, CHUNK_SIZE: tl.constexpr,
     ELEMENT_BITS: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    OFFSET_SRC: tl.constexpr = False,
 ):
     # This operation copies bits. Integer pointers also allow masked zero loads
     # for FP8 FNUZ, which has no direct integer-to-FP8 cast in Triton.
@@ -493,17 +494,50 @@ def _pad_copy_triton_kernel(
     index = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offset = tl.load(offset_ptr).to(tl.int64) * CHUNK_SIZE
     size = tl.load(size_ptr).to(tl.int64) * CHUNK_SIZE
-    local_index = index - offset
+    if OFFSET_SRC:
+        # Scatter: dst is the (graph-padded) local buffer, src the global one.
+        source_index = index + offset
+        copy = index < size
+    else:
+        source_index = index - offset
+        copy = (source_index >= 0) & (source_index < size)
     value = tl.load(
-        src_ptr + local_index,
-        mask=(index < GLOBAL_SIZE) & (local_index >= 0) & (local_index < size),
+        src_ptr + source_index,
+        mask=(index < GLOBAL_SIZE) & copy,
         other=0,
     )
     tl.store(dst_ptr + index, value, mask=index < GLOBAL_SIZE)
 
 
-def pad_copy_triton(dst, src, offset, size):
-    """Write a zero-padded DP slice, preserving GPU metadata on graph replay."""
+@triton.jit
+def _pad_copy_add_triton_kernel(
+    dst_ptr,
+    src_ptr,
+    add_ptr,
+    offset_ptr,
+    size_ptr,
+    GLOBAL_SIZE: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    index = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offset = tl.load(offset_ptr).to(tl.int64) * CHUNK_SIZE
+    size = tl.load(size_ptr).to(tl.int64) * CHUNK_SIZE
+    local_index = index - offset
+    mask = (index < GLOBAL_SIZE) & (local_index >= 0) & (local_index < size)
+    value = tl.load(src_ptr + local_index, mask=mask, other=0.0).to(tl.float32)
+    value += tl.load(add_ptr + local_index, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        dst_ptr + index, value.to(dst_ptr.dtype.element_ty), mask=index < GLOBAL_SIZE
+    )
+
+
+def pad_copy_triton(dst, src, offset, size, offset_src=False):
+    """Write a zero-padded DP slice, preserving GPU metadata on graph replay.
+
+    offset_src=False: dst is the global buffer, src the local rows at dst[offset:].
+    offset_src=True: dst is the local buffer, filled from src[offset:offset + size].
+    """
     assert dst.is_contiguous() and src.is_contiguous()
     assert dst.shape[1:] == src.shape[1:]
     assert dst.dtype == src.dtype
@@ -513,6 +547,28 @@ def pad_copy_triton(dst, src, offset, size):
     block_size = 8192
     _pad_copy_triton_kernel[(triton.cdiv(dst.numel(), block_size),)](
         dst, src, offset, size, dst.numel(), prod(src.shape[1:]), src.element_size()*8, block_size,
+        offset_src,
+    )
+
+
+def pad_copy_add_triton(dst, src, add, offset, size):
+    """pad_copy_triton into the global buffer with `add` summed into the local rows."""
+    assert dst.is_contiguous() and src.is_contiguous() and add.is_contiguous()
+    assert dst.shape[1:] == src.shape[1:] == add.shape[1:]
+    assert dst.dtype == src.dtype == add.dtype and dst.dtype.is_floating_point
+    assert src.untyped_storage() is not dst.untyped_storage()
+    if dst.numel() == 0:
+        return
+    block_size = 8192
+    _pad_copy_add_triton_kernel[(triton.cdiv(dst.numel(), block_size),)](
+        dst,
+        src,
+        add,
+        offset,
+        size,
+        dst.numel(),
+        prod(src.shape[1:]),
+        block_size,
     )
 
 
@@ -521,6 +577,7 @@ def _dp_gather_via_all_reduce(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    residual: Optional[torch.Tensor] = None,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
@@ -531,7 +588,18 @@ def _dp_gather_via_all_reduce(
         is_partial or get_attention_tp_rank() == 0
     )
     fused_copy = _FUSED_DP_PAD_COPY and copy_local and global_tokens.dtype == local_tokens.dtype
-    if fused_copy:
+    add_residual = (
+        residual is not None
+        and local_tokens.shape[0] > 0
+        and get_attention_tp_rank() == 0
+    )
+    if fused_copy and add_residual and residual.dtype == local_tokens.dtype:
+        pad_copy_add_triton(
+            global_tokens, local_tokens, residual, local_start_pos, local_num_tokens
+        )
+    elif fused_copy:
+        if add_residual:
+            local_tokens += residual
         pad_copy_triton(global_tokens, local_tokens, local_start_pos, local_num_tokens)
     else:
         global_tokens.fill_(0)
@@ -540,6 +608,8 @@ def _dp_gather_via_all_reduce(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
+        if add_residual:
+            local_tokens += residual
 
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -564,8 +634,11 @@ def _dp_gather_via_all_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    residual: Optional[torch.Tensor] = None,
 ):
     if get_attention_tp_size() == 1:
+        if residual is not None and local_tokens.shape[0] > 0:
+            local_tokens += residual
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
@@ -576,6 +649,11 @@ def _dp_gather_via_all_gather(
         get_attention_tp_rank()
     ]
     get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    if residual is not None and local_tokens.shape[0] > 0:
+        # The replicated residual is added once, by each rank to its reduced quarter.
+        scattered_local_tokens += residual.tensor_split(get_attention_tp_size())[
+            get_attention_tp_rank()
+        ]
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
@@ -649,6 +727,7 @@ def _dp_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    residual: Optional[torch.Tensor] = None,
 ):
     if (
         is_dp_gatherv_active()
@@ -669,17 +748,19 @@ def _dp_gather(
         if _gatherv_sizes is None or sum(_gatherv_sizes) != global_tokens.shape[0]:
             _gatherv_sizes = _dp_gatherv_sizes(forward_batch)
         if _gatherv_sizes is not None and sum(_gatherv_sizes) == global_tokens.shape[0]:
+            if residual is not None and local_tokens.shape[0] > 0:
+                local_tokens += residual
             _dp_gather_via_all_gatherv(
                 global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
             )
             return
     if forward_batch.dp_padding_mode.is_max_len():
         _dp_gather_via_all_gather(
-            global_tokens, local_tokens, forward_batch, is_partial
+            global_tokens, local_tokens, forward_batch, is_partial, residual
         )
     else:
         _dp_gather_via_all_reduce(
-            global_tokens, local_tokens, forward_batch, is_partial
+            global_tokens, local_tokens, forward_batch, is_partial, residual
         )
 
 
@@ -687,8 +768,13 @@ def dp_gather_partial(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
+    residual: Optional[torch.Tensor] = None,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+    """Gather the attention-TP partial sums of every DP group; `residual` (replicated over
+    attention TP) is added once to the reduced rows."""
+    _dp_gather(
+        global_tokens, local_tokens, forward_batch, is_partial=True, residual=residual
+    )
 
 
 def dp_gather_replicate(
@@ -708,9 +794,18 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
+    if _FUSED_DP_PAD_COPY and local_tokens.dtype == global_tokens.dtype:
+        pad_copy_triton(
+            local_tokens,
+            global_tokens,
+            local_start_pos,
+            local_num_tokens,
+            offset_src=True,
+        )
+        return
+    local_tokens.fill_(0)
     if local_tokens.shape[0] > 0:
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()

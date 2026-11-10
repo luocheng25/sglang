@@ -327,16 +327,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-        self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_gather_cap: int = 0
+        self._draft_greedy_pack_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gathered_pack_buf: Optional[torch.Tensor] = None
         self._draft_greedy_local_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_local_arg_buf: Optional[torch.Tensor] = None
         self._draft_greedy_local_cap: int = 0
-        self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
@@ -941,61 +936,36 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens[start:end] = global_ids.to(torch.long)
                 continue
 
-            # Gather per-rank maxima and associated global ids, then select the global max.
-            needed = tp_size * chunk_len
-            chunk_cap = int(chunk_size)
-            if (
-                self._draft_greedy_gather_cap < needed
-                or self._draft_greedy_gathered_max_buf is None
-                or self._draft_greedy_gathered_ids_buf is None
-                or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
-                or self._draft_greedy_gathered_max_buf.device != hs.device
-            ):
-                # Allocate enough space for the max chunk size to avoid reallocations.
-                cap = tp_size * chunk_cap
-                self._draft_greedy_gathered_max_buf = torch.empty(
-                    (cap,), dtype=local_max.dtype, device=hs.device
-                )
-                self._draft_greedy_gathered_ids_buf = torch.empty(
-                    (cap,), dtype=global_ids.dtype, device=hs.device
-                )
-                self._draft_greedy_gather_cap = cap
+            # Stage (max as FP32 bits, global id) of every chunk for one all-gather per call.
+            if start == 0:
+                pack_cap = max(num_tokens, int(chunk_size))
+                if (
+                    self._draft_greedy_pack_buf is None
+                    or self._draft_greedy_pack_buf.shape[0] < num_tokens
+                    or self._draft_greedy_pack_buf.device != hs.device
+                ):
+                    self._draft_greedy_pack_buf = torch.empty(
+                        (pack_cap, 2), dtype=torch.int32, device=hs.device
+                    )
+                    self._draft_greedy_gathered_pack_buf = torch.empty(
+                        (tp_size * pack_cap * 2,), dtype=torch.int32, device=hs.device
+                    )
+                local_pack = self._draft_greedy_pack_buf[:num_tokens]
+            local_pack[start:end, 0].copy_(
+                local_max.to(torch.float32).view(torch.int32)
+            )
+            local_pack[start:end, 1].copy_(global_ids)
 
-            if (
-                self._draft_greedy_index_cap < chunk_len
-                or self._draft_greedy_best_rank_buf is None
-                or self._draft_greedy_rank_index_buf is None
-                or self._draft_greedy_selected_ids_buf is None
-                or self._draft_greedy_best_rank_buf.device != hs.device
-                or self._draft_greedy_selected_ids_buf.device != hs.device
-            ):
-                self._draft_greedy_best_rank_buf = torch.empty(
-                    (chunk_cap,), dtype=torch.int64, device=hs.device
-                )
-                self._draft_greedy_rank_index_buf = torch.empty(
-                    (1, chunk_cap), dtype=torch.int64, device=hs.device
-                )
-                self._draft_greedy_selected_ids_buf = torch.empty(
-                    (1, chunk_cap), dtype=torch.int64, device=hs.device
-                )
-                self._draft_greedy_index_cap = chunk_cap
-
-            gathered_max = self._draft_greedy_gathered_max_buf[:needed]
-            gathered_ids = self._draft_greedy_gathered_ids_buf[:needed]
-
-            tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
-            tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
-            gathered_max = gathered_max.view(tp_size, chunk_len)
-            gathered_ids = gathered_ids.view(tp_size, chunk_len)
-
-            best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
-            torch.argmax(gathered_max, dim=0, out=best_rank)
-
-            rank_index = self._draft_greedy_rank_index_buf[:, :chunk_len]
-            rank_index[0].copy_(best_rank)
-            selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
-            torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
-            out_tokens[start:end].copy_(selected_ids.view(-1))
+        if tp_size > 1:
+            # Every rank's (max, id) pairs; the first rank holding the maximum wins, as
+            # with argmax over the gathered maxima.
+            gathered = self._draft_greedy_gathered_pack_buf[: tp_size * num_tokens * 2]
+            tp_group.all_gather_into_tensor(gathered, local_pack.view(-1))
+            gathered = gathered.view(tp_size, num_tokens, 2)
+            best_rank = torch.argmax(gathered[:, :, 0].view(torch.float32), dim=0)
+            out_tokens.copy_(
+                torch.gather(gathered[:, :, 1], 0, best_rank.unsqueeze(0)).view(-1)
+            )
 
         return out_tokens
 

@@ -1245,8 +1245,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
-            elif context.attn_tp_rank == 0:
-                hidden_states += residual
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
@@ -1255,7 +1253,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if use_layer_norm_before_gather:
                 dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             else:
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                dp_gather_partial(
+                    hidden_states, local_hidden_states, forward_batch, residual=residual
+                )
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)

@@ -26,7 +26,10 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
-from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
+from sglang.srt.layers.attention.qsa.kernel import (
+    qsa_sparse_attention,
+    store_qsa_kv_fp8,
+)
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
@@ -278,7 +281,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
             self._pyhip_attention = PyHIPAttention()
             if runner.kv_cache_dtype == torch.float8_e4m3fnuz:
-                # set_kv_buffer gets no scales here: the pool holds K/V cast to FP8.
+                # _save_kv_cache casts K/V to FP8 without scales.
                 self._pyhip_fp8_scale = torch.ones(
                     1, dtype=torch.float32, device=runner.device
                 )
@@ -1456,6 +1459,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
+    def _save_kv_cache(self, layer, forward_batch, k, v) -> None:
+        pool = self.token_to_kv_pool
+        if self._pyhip_fp8_scale is None:
+            pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+            return
+        # One launch; the hybrid pool's set_kv_buffer takes five (unit-scale
+        # divides, casts, copy) per layer.
+        store_qsa_kv_fp8(
+            k,
+            v,
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
+            forward_batch.out_cache_loc,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1470,9 +1488,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._save_kv_cache(layer, forward_batch, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1793,9 +1809,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._save_kv_cache(layer, forward_batch, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.attention.qsa.kernel import store_qsa_kv_fp8
 from sglang.srt.layers.attention.qsa.sparse_attn_decode import (
     SparsePagedGQAWorkspace,
     _kernel_config,
@@ -240,6 +241,33 @@ def test_fp8_cache_reads_as_bf16(splits):
     expected = run((q, k8.to(q.dtype), v8.to(q.dtype), *rest), kv_splits=splits)
     assert torch.equal(actual, expected)
     assert_reference(actual, (q, k8.float(), v8.float(), *rest))
+
+
+def test_fp8_kv_store_matches_cast_and_skips_padding_slot():
+    """The fused store writes torch's FP8 cast of each row, except to slot 0."""
+    torch.manual_seed(0)
+    fp8 = torch.float8_e4m3fnuz
+    # Token-strided K/V, as a QKV split leaves them.
+    qkv = torch.randn(9, 3, 256, device="cuda", dtype=torch.bfloat16) * 40
+    k, v = qkv[:, 1:2], qkv[:, 2:3]
+    # Beyond the FP8 range: torch's cast gives NaN, the store saturates.
+    k[0, 0, :3] = torch.tensor([300.0, -500.0, 248.0])
+    k_cache = torch.full((64, 1, 256), 7, dtype=torch.uint8, device="cuda").view(fp8)
+    v_cache = k_cache.clone()
+    slots = torch.tensor([5, 0, 63, 17, 1, 40, 2, 33, 9], device="cuda")
+    store_qsa_kv_fp8(k, v, k_cache, v_cache, slots)
+    store_qsa_kv_fp8(k[:0], v[:0], k_cache, v_cache, slots[:0])
+
+    written = slots != 0
+    untouched = torch.ones(64, dtype=torch.bool, device="cuda")
+    untouched[slots[written]] = False
+    for cache, rows in ((k_cache, k), (v_cache, v)):
+        stored = cache[slots[written]].view(torch.uint8)
+        cast = rows[written].to(fp8).view(torch.uint8)
+        in_range = rows[written].abs() < 248
+        assert torch.equal(stored[in_range], cast[in_range])
+        assert bool((cache[untouched].view(torch.uint8) == 7).all())
+    assert k_cache[5, 0, :3].float().tolist() == [240.0, -240.0, 240.0]
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])

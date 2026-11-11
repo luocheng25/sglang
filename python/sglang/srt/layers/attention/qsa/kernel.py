@@ -343,6 +343,85 @@ def qsa_sparse_attention_reference(
     return torch.stack(outputs)
 
 
+# debug=True compiles the device_assert in, as store_cache's always-on bound check.
+@triton.jit(debug=True)
+def _store_qsa_kv_fp8_kernel(
+    k,
+    v,
+    k_cache,
+    v_cache,
+    slots,
+    k_stride,
+    v_stride,
+    k_cache_stride,
+    v_cache_stride,
+    num_slots,
+    K_ROW: tl.constexpr,
+    V_ROW: tl.constexpr,
+    K_BLOCK: tl.constexpr,
+    V_BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    slot = tl.load(slots + token).to(tl.int64)
+    tl.device_assert((slot >= 0) & (slot < num_slots), "KV slot out of range")
+    # Slot 0 is the reserved padding slot, which store_cache skips too.
+    if slot != 0:
+        cols = tl.arange(0, K_BLOCK)
+        row = tl.load(k + token * k_stride + cols, mask=cols < K_ROW)
+        tl.store(
+            k_cache + slot * k_cache_stride + cols,
+            row.to(k_cache.dtype.element_ty),
+            mask=cols < K_ROW,
+        )
+        cols = tl.arange(0, V_BLOCK)
+        row = tl.load(v + token * v_stride + cols, mask=cols < V_ROW)
+        tl.store(
+            v_cache + slot * v_cache_stride + cols,
+            row.to(v_cache.dtype.element_ty),
+            mask=cols < V_ROW,
+        )
+
+
+def store_qsa_kv_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slots: torch.Tensor,
+) -> None:
+    """Cast K/V token rows to the FP8 caches' dtype and store them at ``slots``.
+
+    One kernel for what ``set_kv_buffer`` does in a unit-scale divide, a cast and a
+    copy per tensor. Bit-identical to torch's cast except for finite values beyond
+    the FP8 range, which saturate here and become NaN in torch's.
+    """
+    rows = slots.shape[0]
+    if rows == 0:
+        return
+    k_cache = k_cache.view(k_cache.shape[0], -1)
+    v_cache = v_cache.view(v_cache.shape[0], -1)
+    k = k.view(rows, k_cache.shape[1])
+    v = v.view(rows, v_cache.shape[1])
+    _store_qsa_kv_fp8_kernel[(rows,)](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        slots,
+        k.stride(0),
+        v.stride(0),
+        k_cache.stride(0),
+        v_cache.stride(0),
+        k_cache.shape[0],
+        K_ROW=k.shape[1],
+        V_ROW=v.shape[1],
+        K_BLOCK=triton.next_power_of_2(k.shape[1]),
+        V_BLOCK=triton.next_power_of_2(v.shape[1]),
+        # Measured on gfx942: one wave per token beats wider CTAs up to 16k rows.
+        num_warps=1,
+    )
+
+
 __all__ = [
     "average_pool_qsa_keys",
     "expand_qsa_block_indices",
@@ -351,4 +430,5 @@ __all__ = [
     "qsa_fast_topk",
     "qsa_sparse_attention",
     "qsa_sparse_attention_reference",
+    "store_qsa_kv_fp8",
 ]

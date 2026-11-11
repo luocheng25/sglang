@@ -207,17 +207,6 @@ class _AttentionPool:
         return self.values
 
 
-class _FP8AttentionPool(_AttentionPool):
-    """FP8 K/V as SGLang's MHA pool keeps them: cast without scales, written as bytes."""
-
-    def set_kv_buffer(self, layer, locations, keys, values):
-        for pool, new in ((self.keys, keys), (self.values, values)):
-            pool.view(torch.uint8).index_copy_(
-                0, locations.long(), new.to(pool.dtype).view(torch.uint8)
-            )
-        self.write_calls += 1
-
-
 @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
 class TestPyHIPQSA(CustomTestCase):
     @classmethod
@@ -285,7 +274,7 @@ class TestPyHIPQSA(CustomTestCase):
                     )
                     table = table.roll(64, dims=1)
                     shape = (len(queries) * width + 2, 1, 256)
-                    pool = (_FP8AttentionPool if fp8 else _AttentionPool)(
+                    pool = _AttentionPool(
                         torch.randn(shape, device=self.device).to(kv_dtype),
                         torch.randn(shape, device=self.device).to(kv_dtype),
                     )
@@ -391,8 +380,19 @@ class TestPyHIPQSA(CustomTestCase):
                     )
                     # An FP8 pool is read through the slots also without a prefix.
                     pool_read = any(prefixes) or fp8
-                    self.assertEqual(pool.write_calls, 1)
-                    self.assertEqual(pool.read_calls, 2 if pool_read else 0)
+                    # The backend casts and stores FP8 K/V itself, into the pool's buffers.
+                    self.assertEqual(pool.write_calls, 0 if fp8 else 1)
+                    self.assertEqual(
+                        pool.read_calls, (2 if fp8 else 0) + (2 if pool_read else 0)
+                    )
+                    if fp8:
+                        for cache, new in ((pool.keys, keys), (pool.values, values)):
+                            self.assertTrue(
+                                torch.equal(
+                                    cache[locations.long()].view(torch.uint8),
+                                    new.to(cache.dtype).view(torch.uint8),
+                                )
+                            )
                     packed_keys = torch.cat(
                         [
                             pool.keys[table[request, :length].long()].to(query.dtype)

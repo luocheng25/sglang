@@ -863,6 +863,7 @@ def test_qsa_extend_matches_with_and_without_dp_attention_padding(monkeypatch):
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._pyhip_fp8_scale = None
     backend.forward_metadata = metadata
 
     class Pool:
@@ -913,6 +914,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._pyhip_fp8_scale = None
     backend._pyhip_attention = None
 
     class Pool:
@@ -954,6 +956,7 @@ def _make_paged_extend_backend():
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._pyhip_fp8_scale = None
     backend.forward_metadata = metadata
 
     class Pool:

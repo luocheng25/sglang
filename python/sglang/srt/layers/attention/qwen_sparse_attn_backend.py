@@ -261,12 +261,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._pyhip_attention = None
+        # Unit dequantization scale of an FP8 pool read by PyHIP (None otherwise).
+        self._pyhip_fp8_scale = None
         profile = self.qsa_profile
         if (
             _USE_PYHIP_QSA_ATTENTION
             and runner is not None
             and runner.ps.attn_cp_size == runner.ps.attn_dcp_size == 1
-            and runner.kv_cache_dtype == torch.bfloat16
+            and runner.kv_cache_dtype in (torch.bfloat16, torch.float8_e4m3fnuz)
             and profile is not None
             and profile.variant == QSA_VARIANT_COMPRESSED
             and (profile.compress_ratio, profile.block_topk, profile.budget)
@@ -275,9 +277,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
 
             self._pyhip_attention = PyHIPAttention()
+            if runner.kv_cache_dtype == torch.float8_e4m3fnuz:
+                # set_kv_buffer gets no scales here: the pool holds K/V cast to FP8.
+                self._pyhip_fp8_scale = torch.ones(
+                    1, dtype=torch.float32, device=runner.device
+                )
             logger.info(
-                "Using installed PyHIP for gfx942 QSA prefill attention (draft=%s)",
+                "Using installed PyHIP for gfx942 QSA prefill attention "
+                "(draft=%s, kv=%s)",
                 runner.is_draft_worker,
+                runner.kv_cache_dtype,
             )
 
     @staticmethod
@@ -722,7 +731,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
-                extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+                extend_seq_lens_cpu = getattr(
+                    forward_batch, "extend_seq_lens_cpu", None
+                )
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -838,7 +849,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             cpu_extend_lens = [
                 int(length) for length in forward_batch.extend_seq_lens_cpu[:batch_size]
             ]
-            if any(
+            # PyHIP reads an FP8 pool through the slots also without a prefix.
+            if self._pyhip_fp8_scale is not None or any(
                 seq_len > extend_len
                 for seq_len, extend_len in zip(cpu_seq_lens, cpu_extend_lens)
             ):
@@ -1517,7 +1529,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 (1, 0),
             ).contiguous()
         )
-        if not any(prefix_lens):
+        # FP8 pools go through the pool path below even without a prefix, so the
+        # FP8 kernels read the K/V that decode reads.
+        fp8_pool = can_use_pyhip_attention and self._pyhip_fp8_scale is not None
+        if not any(prefix_lens) and not fp8_pool:
             if can_use_pyhip_attention:
                 output = self._pyhip_attention.forward(
                     q=q.contiguous(),
@@ -1559,6 +1574,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         key_buffer = pool.get_key_buffer(layer.layer_id)
         value_buffer = pool.get_value_buffer(layer.layer_id)
+        fp8_scales = {}
+        if fp8_pool and key_buffer.dtype == torch.float8_e4m3fnuz:
+            fp8_scales = dict(
+                k_scale=self._pyhip_fp8_scale, v_scale=self._pyhip_fp8_scale
+            )
         if can_use_pyhip_attention and self._pyhip_attention.can_read_kv_slots(
             key_buffer=key_buffer, value_buffer=value_buffer, slots=slots
         ):
@@ -1572,6 +1592,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 scale=layer.scaling,
                 layer_id=layer.layer_id,
                 kv_slots=slots,
+                **fp8_scales,
             )
             return self._pad_extend_output(output, num_output_rows)
         packed_k = key_buffer.index_select(0, slots)
@@ -1586,8 +1607,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 prefix_lens=prefix_lens,
                 scale=layer.scaling,
                 layer_id=layer.layer_id,
+                **fp8_scales,
             )
             return self._pad_extend_output(output, num_output_rows)
+        if packed_k.dtype != q.dtype:
+            # The Triton kernel reads K/V in Q's dtype; FP8 pools hold unscaled K/V.
+            packed_k, packed_v = packed_k.to(q.dtype), packed_v.to(q.dtype)
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )

@@ -230,6 +230,18 @@ def test_supported_head_layouts(heads, kv_heads, dim, supported):
     assert supports_sparse_paged_gqa(q, k, v) == supported
 
 
+@pytest.mark.parametrize("splits", [1, 64])
+def test_fp8_cache_reads_as_bf16(splits):
+    """An FP8 cache of unscaled K/V gives the BF16 cache's output for the same values."""
+    q, k, v, *rest = make_inputs(tokens=4)
+    k8, v8 = k.to(torch.float8_e4m3fnuz), v.to(torch.float8_e4m3fnuz)
+    assert supports_sparse_paged_gqa(q, k8, v8)
+    actual = run((q, k8, v8, *rest), kv_splits=splits)
+    expected = run((q, k8.to(q.dtype), v8.to(q.dtype), *rest), kv_splits=splits)
+    assert torch.equal(actual, expected)
+    assert_reference(actual, (q, k8.float(), v8.float(), *rest))
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_unsupported_dtype(dtype):
     q, k, v, *_ = make_inputs()

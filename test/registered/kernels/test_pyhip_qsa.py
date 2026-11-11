@@ -207,6 +207,17 @@ class _AttentionPool:
         return self.values
 
 
+class _FP8AttentionPool(_AttentionPool):
+    """FP8 K/V as SGLang's MHA pool keeps them: cast without scales, written as bytes."""
+
+    def set_kv_buffer(self, layer, locations, keys, values):
+        for pool, new in ((self.keys, keys), (self.values, values)):
+            pool.view(torch.uint8).index_copy_(
+                0, locations.long(), new.to(pool.dtype).view(torch.uint8)
+            )
+        self.write_calls += 1
+
+
 @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
 class TestPyHIPQSA(CustomTestCase):
     @classmethod
@@ -239,8 +250,25 @@ class TestPyHIPQSA(CustomTestCase):
     def test_draft_prefill_attention_cache_and_padding(self):
         self._check_attention_cache_and_padding(is_draft_worker=True)
 
-    def _check_attention_cache_and_padding(self, *, is_draft_worker):
+    @torch.no_grad()
+    def test_fp8_cache_attention(self):
+        """An FP8 pool is read through the slot table in every chunk, FP8 MFMA."""
+        self._check_attention_cache_and_padding(
+            is_draft_worker=False, kv_dtype=torch.float8_e4m3fnuz
+        )
+
+    @torch.no_grad()
+    def test_fp8_cache_attention_bf16_compute(self):
+        self._check_attention_cache_and_padding(
+            is_draft_worker=False, kv_dtype=torch.float8_e4m3fnuz, fp8_mfma=False
+        )
+
+    def _check_attention_cache_and_padding(
+        self, *, is_draft_worker, kv_dtype=torch.bfloat16, fp8_mfma=True
+    ):
         from pyhip.testing.qsa_reference import reference
+
+        fp8 = kv_dtype == torch.float8_e4m3fnuz
 
         for heads in (12, 6, 3):
             for queries, prefixes in (((33,), (0,)), ((7, 0, 9), (2048, 0, 12))):
@@ -257,9 +285,9 @@ class TestPyHIPQSA(CustomTestCase):
                     )
                     table = table.roll(64, dims=1)
                     shape = (len(queries) * width + 2, 1, 256)
-                    pool = _AttentionPool(
-                        torch.randn(shape, dtype=torch.bfloat16, device=self.device),
-                        torch.randn(shape, dtype=torch.bfloat16, device=self.device),
+                    pool = (_FP8AttentionPool if fp8 else _AttentionPool)(
+                        torch.randn(shape, device=self.device).to(kv_dtype),
+                        torch.randn(shape, device=self.device).to(kv_dtype),
                     )
                     req_pool = SimpleNamespace(req_to_token=table)
                     runner = SimpleNamespace(
@@ -270,12 +298,16 @@ class TestPyHIPQSA(CustomTestCase):
                             hf_text_config=_config(), context_len=8192
                         ),
                         is_draft_worker=is_draft_worker,
-                        kv_cache_dtype=torch.bfloat16,
+                        kv_cache_dtype=kv_dtype,
                         ps=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
                     )
                     with envs.SGLANG_USE_PYHIP_QSA.override(
                         True
-                    ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
+                    ), envs.SGLANG_TEST_PYHIP_QSA.override(
+                        True
+                    ), envs.SGLANG_OPT_PYHIP_QSA_FP8_MFMA.override(
+                        fp8_mfma
+                    ):
                         backend = QwenSparseAttnBackend(runner)
                     self.assertIsNotNone(backend._pyhip_attention)
                     slot_reads = []
@@ -357,17 +389,19 @@ class TestPyHIPQSA(CustomTestCase):
                     output = backend.forward_extend(
                         query, keys, values, layer, batch, topk_indices=indices
                     )
+                    # An FP8 pool is read through the slots also without a prefix.
+                    pool_read = any(prefixes) or fp8
                     self.assertEqual(pool.write_calls, 1)
-                    self.assertEqual(pool.read_calls, 2 if any(prefixes) else 0)
+                    self.assertEqual(pool.read_calls, 2 if pool_read else 0)
                     packed_keys = torch.cat(
                         [
-                            pool.keys[table[request, :length].long()]
+                            pool.keys[table[request, :length].long()].to(query.dtype)
                             for request, length in enumerate(lengths)
                         ]
                     )
                     packed_values = torch.cat(
                         [
-                            pool.values[table[request, :length].long()]
+                            pool.values[table[request, :length].long()].to(query.dtype)
                             for request, length in enumerate(lengths)
                         ]
                     )
@@ -380,19 +414,23 @@ class TestPyHIPQSA(CustomTestCase):
                         prefix_lens=prefixes,
                         scale=1 / 16,
                     )
-                    torch.testing.assert_close(
-                        output[:rows].reshape_as(query[:rows]).float(),
-                        expected,
-                        rtol=0.02,
-                        atol=0.02,
-                    )
+                    actual = output[:rows].reshape_as(query[:rows]).float()
+                    if fp8 and fp8_mfma:
+                        # FP8 Q and probabilities (PyHIP's FP8 error bounds).
+                        error = (actual - expected).norm(dim=-1) / expected.norm(dim=-1)
+                        self.assertLess(float(error.mean()), 0.06)
+                        self.assertLess(float(error.max()), 0.16)
+                    else:
+                        torch.testing.assert_close(
+                            actual, expected, rtol=0.02, atol=0.02
+                        )
                     self.assertEqual(output.shape, (rows + 2, heads * 256))
                     self.assertTrue(bool((output[rows:] == 0).all()))
                     self.assertEqual(len(backend._pyhip_attention.checked_layouts), 1)
                     # Prefixed chunks read the pool in place through the slot table; the
                     # gather fallback (a pool PyHIP cannot read in place) gives the same output.
-                    self.assertEqual(slot_reads, [any(prefixes)])
-                    if any(prefixes):
+                    self.assertEqual(slot_reads, [pool_read])
+                    if pool_read:
                         with patch.object(
                             backend._pyhip_attention,
                             "can_read_kv_slots",

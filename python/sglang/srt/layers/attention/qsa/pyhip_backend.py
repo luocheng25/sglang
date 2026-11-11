@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 # so TP2 breaks even near 16k keys per row; these keep a 2x margin.
 _SPLIT_MIN_ROWS = 2048
 _SPLIT_MIN_KEYS_PER_ROW = 32768
+# PyHIP's FP8 attention kernels address a whole FP8 K/V pool with unsigned
+# 32-bit byte offsets.
+_FP8_POOL_MAX_BYTES = 2**32 - 2**20
 
 
 def _worth_splitting(*, lengths, extends):
@@ -58,6 +61,8 @@ class PyHIPAttention:
 
         self.attention = attention
         self.validate = envs.SGLANG_TEST_PYHIP_QSA.get()
+        # FP8 K/V: FP8 MFMA (FP8 Q and probabilities), or dequantized to BF16.
+        self.fp8_compute = "fp8" if envs.SGLANG_OPT_PYHIP_QSA_FP8_MFMA.get() else "bf16"
         self.checked_layouts = set()
 
     @staticmethod
@@ -101,6 +106,10 @@ class PyHIPAttention:
             and key_buffer.shape == value_buffer.shape
             and key_buffer.is_contiguous()
             and value_buffer.is_contiguous()
+            and (
+                key_buffer.dtype != torch.float8_e4m3fnuz
+                or key_buffer.numel() <= _FP8_POOL_MAX_BYTES
+            )
         )
 
     def forward(
@@ -115,8 +124,14 @@ class PyHIPAttention:
         scale,
         layer_id,
         kv_slots=None,
+        k_scale=None,
+        v_scale=None,
     ):
         # With kv_slots, k/v are the layer's token pool and kv_slots maps packed context tokens to it.
+        # FP8 K/V come with FP32 dequantization scales (K8 * k_scale).
+        fp8 = {}
+        if k_scale is not None:
+            fp8 = dict(k_scale=k_scale, v_scale=v_scale, compute=self.fp8_compute)
         output = self.attention(
             q,
             k,
@@ -126,6 +141,7 @@ class PyHIPAttention:
             prefix_lens=prefix_lens,
             softmax_scale=scale,
             kv_slots=kv_slots,
+            **fp8,
         )
         layout = (layer_id, tuple(query_lens), tuple(prefix_lens), q.shape[1], scale)
         if self.validate and layout not in self.checked_layouts:
@@ -133,7 +149,12 @@ class PyHIPAttention:
 
             if kv_slots is not None:
                 k, v = k.index_select(0, kv_slots), v.index_select(0, kv_slots)
-            check_attention(
+            if fp8:
+                # The reference reads K/V in Q's dtype; FP8 -> BF16 is exact and the
+                # FP32 scale product rounds once (exact for unit scales).
+                k = k.to(q.dtype).mul_(k_scale)
+                v = v.to(q.dtype).mul_(v_scale)
+            stats = check_attention(
                 q=q,
                 k=k,
                 v=v,
@@ -142,13 +163,15 @@ class PyHIPAttention:
                 query_lens=query_lens,
                 prefix_lens=prefix_lens,
                 scale=scale,
+                fp8_compute=fp8.get("compute") == "fp8",
             )
             self.checked_layouts.add(layout)
             logger.info(
-                "PyHIP QSA attention checked: layer=%s queries=%s prefixes=%s",
+                "PyHIP QSA attention checked: layer=%s queries=%s prefixes=%s%s",
                 layer_id,
                 query_lens,
                 prefix_lens,
+                "" if stats is None else f" fp8={stats}",
             )
         return output
 

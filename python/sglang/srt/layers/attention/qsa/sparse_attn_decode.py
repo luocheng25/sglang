@@ -33,7 +33,10 @@ def supports_sparse_paged_gqa(q, k_cache, v_cache) -> bool:
         and k_cache.ndim == 3
         and v_cache.shape == k_cache.shape
         and q.device == k_cache.device == v_cache.device
-        and q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+        and q.dtype == torch.bfloat16
+        # An FP8 cache holds K/V cast without scales; the kernel reads it as BF16.
+        and k_cache.dtype == v_cache.dtype
+        and k_cache.dtype in (torch.bfloat16, torch.float8_e4m3fnuz)
         and q.shape[2] == k_cache.shape[2]
         and q.shape[2] in (128, 256)
         and k_cache.shape[1] > 0
@@ -262,7 +265,7 @@ def _qsa_sparse_paged_gqa_kernel(
             cache_modifier=".cg",
         )
 
-        scores = tl.where(valid[None, :], tl.dot(query, keys), -1.0e20)
+        scores = tl.where(valid[None, :], tl.dot(query, keys.to(query.dtype)), -1.0e20)
         next_max = tl.maximum(running_max, tl.max(scores, axis=1))
         alpha = tl.math.exp2(running_max - next_max)
         probabilities = tl.where(
@@ -271,8 +274,8 @@ def _qsa_sparse_paged_gqa_kernel(
             0.0,
         )
         accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
+            probabilities.to(query.dtype),
+            values.to(query.dtype),
             acc=accumulator * alpha[:, None],
         )
         running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
@@ -321,12 +324,16 @@ def qsa_sparse_paged_gqa(
 ) -> torch.Tensor:
     """Attend to logical indices in 3D token-slot K/V (negative = padding).
 
+    K/V are BF16, or an FP8 (E4M3FNUZ) cache of unscaled values read as BF16.
+
     Request IDs index the real request pool, not a batch-local/dummy graph
     table. Invalid requests, logical positions, physical slots and positions
     past each query's visible length are masked. Empty rows return zero.
     """
     if not supports_sparse_paged_gqa(q, k_cache, v_cache):
-        raise ValueError("paged QSA requires gfx942 BF16 GQA with head_dim 128/256")
+        raise ValueError(
+            "paged QSA requires gfx942 BF16 GQA (BF16 or FP8 K/V) with head_dim 128/256"
+        )
     tensors = (logical_indices, block_table, token_to_request, sequence_lengths)
     if any(t.device != q.device for t in tensors):
         raise ValueError("all paged QSA inputs must be on the same device")

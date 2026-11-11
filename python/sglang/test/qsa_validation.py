@@ -13,13 +13,55 @@ from sglang.srt.layers.attention.qsa.metadata import qsa_ring_slots_per_request
 logger = logging.getLogger(__name__)
 
 
-def check_attention(*, q, k, v, indices, output, query_lens, prefix_lens, scale):
+def check_attention(
+    *, q, k, v, indices, output, query_lens, prefix_lens, scale, fp8_compute=False
+):
     from pyhip.testing.qsa_reference import reference
 
-    expected = reference(
-        q, k, v, indices, query_lens=query_lens, prefix_lens=prefix_lens, scale=scale
-    )
+    def run(query):
+        return reference(
+            query,
+            k,
+            v,
+            indices,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
+            scale=scale,
+        )
+
+    expected = run(q)
+    if fp8_compute:
+        from pyhip.testing.qsa_reference import fp8_query
+
+        return _check_fp8_attention(output.float(), expected, run(fp8_query(q)))
     torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=0.02)
+
+
+def _relative_errors(output, expected):
+    """Per-(row, head) norm-relative errors; norms below the median count as the median, so
+    outputs whose values cancel keep their absolute error."""
+    norms = expected.norm(dim=-1)
+    median = norms.median().clamp_min(1e-6)
+    error = (output - expected).norm(dim=-1) / torch.maximum(norms, median)
+    return error, float(norms.flatten()[error.argmax()] / median)
+
+
+def _check_fp8_attention(output, exact, fp8_reference):
+    """FP8 MFMA (FP8 Q and probabilities). The FP8 rounding of Q is deterministic but grows
+    with sharp scores, so check against the reference on PyHIP's own FP8 Q, which leaves the
+    FP8 probabilities (mean below 5%, worst below 20%; a wrong selection or layout gives
+    errors near 1). Errors against the exact reference are reported."""
+    error, worst_norm = _relative_errors(output, fp8_reference)
+    exact_error, _ = _relative_errors(output, exact)
+    stats = dict(
+        mean=round(float(error.mean()), 5),
+        worst=round(float(error.max()), 5),
+        worst_norm=round(worst_norm, 3),
+        exact_mean=round(float(exact_error.mean()), 5),
+        exact_worst=round(float(exact_error.max()), 5),
+    )
+    assert stats["mean"] < 0.05 and stats["worst"] < 0.2, f"FP8 attention {stats}"
+    return stats
 
 
 def _selection_valid(*, logits, lengths, actual, expected, real):

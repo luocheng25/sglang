@@ -263,8 +263,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        # PyHIPAttention, or AiterQSAAttention with SGLANG_USE_AITER_QSA_PREFILL.
         self._pyhip_attention = None
-        # Unit dequantization scale of an FP8 pool read by PyHIP (None otherwise).
+        # Unit dequantization scale of an FP8 pool read by that adapter (None otherwise).
         self._pyhip_fp8_scale = None
         profile = self.qsa_profile
         if (
@@ -277,17 +278,30 @@ class QwenSparseAttnBackend(AttentionBackend):
             and (profile.compress_ratio, profile.block_topk, profile.budget)
             == (4, 512, 2048)
         ):
-            from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
+            if envs.SGLANG_USE_AITER_QSA_PREFILL.get():
+                from sglang.srt.layers.attention.qsa.aiter_prefill import (
+                    AiterQSAAttention,
+                )
 
-            self._pyhip_attention = PyHIPAttention()
+                self._pyhip_attention = AiterQSAAttention(
+                    kv_cache_dtype=runner.kv_cache_dtype
+                )
+                implementation = "aiter"
+            else:
+                from sglang.srt.layers.attention.qsa.pyhip_backend import (
+                    PyHIPAttention,
+                )
+
+                self._pyhip_attention = PyHIPAttention()
+                implementation = "installed PyHIP"
             if runner.kv_cache_dtype == torch.float8_e4m3fnuz:
                 # _save_kv_cache casts K/V to FP8 without scales.
                 self._pyhip_fp8_scale = torch.ones(
                     1, dtype=torch.float32, device=runner.device
                 )
             logger.info(
-                "Using installed PyHIP for gfx942 QSA prefill attention "
-                "(draft=%s, kv=%s)",
+                "Using %s for gfx942 QSA prefill attention (draft=%s, kv=%s)",
+                implementation,
                 runner.is_draft_worker,
                 runner.kv_cache_dtype,
             )

@@ -1,6 +1,7 @@
 """Direct PyHIP wiring: cache ownership, ragged prefill, graph decode and graph verify."""
 
 import importlib.util
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,12 +9,14 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.aiter_prefill import AiterQSAAttention
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
     build_pending_ring_slots,
     qsa_ring_slots_per_request,
 )
+from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QSAMTPSharedSparseIndices,
@@ -252,12 +255,36 @@ class TestPyHIPQSA(CustomTestCase):
             is_draft_worker=False, kv_dtype=torch.float8_e4m3fnuz, fp8_mfma=False
         )
 
+    @torch.no_grad()
+    def test_aiter_attention_cache_and_padding(self):
+        """SGLANG_USE_AITER_QSA_PREFILL serves the same checks through aiter."""
+        self._check_attention_cache_and_padding(is_draft_worker=False, aiter=True)
+
+    @torch.no_grad()
+    def test_aiter_fp8_cache_attention(self):
+        """Without aiter FP8 K/V support the adapter declines an FP8 pool with a logged
+        reason and SGLang's kernel serves the layer; with it, the pool is read as above.
+        """
+        self._check_attention_cache_and_padding(
+            is_draft_worker=False, kv_dtype=torch.float8_e4m3fnuz, aiter=True
+        )
+
     def _check_attention_cache_and_padding(
-        self, *, is_draft_worker, kv_dtype=torch.bfloat16, fp8_mfma=True
+        self, *, is_draft_worker, kv_dtype=torch.bfloat16, fp8_mfma=True, aiter=False
     ):
         from pyhip.testing.qsa_reference import reference
 
         fp8 = kv_dtype == torch.float8_e4m3fnuz
+        declines = False
+        if aiter:
+            if importlib.util.find_spec("aiter") is None:
+                self.skipTest("aiter is not installed")
+            from aiter.ops.qsa import qsa_sparse_prefill
+
+            declines = (
+                fp8
+                and "k_scale" not in inspect.signature(qsa_sparse_prefill).parameters
+            )
 
         for heads in (12, 6, 3):
             for queries, prefixes in (((33,), (0,)), ((7, 0, 9), (2048, 0, 12))):
@@ -296,9 +323,14 @@ class TestPyHIPQSA(CustomTestCase):
                         True
                     ), envs.SGLANG_OPT_PYHIP_QSA_FP8_MFMA.override(
                         fp8_mfma
+                    ), envs.SGLANG_USE_AITER_QSA_PREFILL.override(
+                        aiter
                     ):
                         backend = QwenSparseAttnBackend(runner)
-                    self.assertIsNotNone(backend._pyhip_attention)
+                    self.assertIsInstance(
+                        backend._pyhip_attention,
+                        AiterQSAAttention if aiter else PyHIPAttention,
+                    )
                     slot_reads = []
                     forward = backend._pyhip_attention.forward
 
@@ -375,11 +407,21 @@ class TestPyHIPQSA(CustomTestCase):
                             ]
                         )
                     )
-                    output = backend.forward_extend(
-                        query, keys, values, layer, batch, topk_indices=indices
-                    )
-                    # An FP8 pool is read through the slots also without a prefix.
-                    pool_read = any(prefixes) or fp8
+                    if declines:
+                        with self.assertLogs(
+                            "sglang.srt.layers.attention.qsa.aiter_prefill", "WARNING"
+                        ) as logs:
+                            output = backend.forward_extend(
+                                query, keys, values, layer, batch, topk_indices=indices
+                            )
+                        self.assertIn("FP8", logs.output[0])
+                    else:
+                        output = backend.forward_extend(
+                            query, keys, values, layer, batch, topk_indices=indices
+                        )
+                    # An FP8 pool is read through the slots also without a prefix;
+                    # SGLang's kernel reads the pool only for prefixed chunks.
+                    pool_read = any(prefixes) or (fp8 and not declines)
                     # The backend casts and stores FP8 K/V itself, into the pool's buffers.
                     self.assertEqual(pool.write_calls, 0 if fp8 else 1)
                     self.assertEqual(
@@ -405,6 +447,9 @@ class TestPyHIPQSA(CustomTestCase):
                             for request, length in enumerate(lengths)
                         ]
                     )
+                    if declines and not pool_read:
+                        # SGLang's kernel reads the chunk's own BF16 K/V, not the FP8 pool.
+                        packed_keys, packed_values = keys[:rows], values[:rows]
                     expected = reference(
                         query[:rows],
                         packed_keys,
@@ -415,7 +460,7 @@ class TestPyHIPQSA(CustomTestCase):
                         scale=1 / 16,
                     )
                     actual = output[:rows].reshape_as(query[:rows]).float()
-                    if fp8 and fp8_mfma:
+                    if fp8 and fp8_mfma and not declines:
                         # FP8 Q and probabilities (PyHIP's FP8 error bounds).
                         error = (actual - expected).norm(dim=-1) / expected.norm(dim=-1)
                         self.assertLess(float(error.mean()), 0.06)
@@ -426,11 +471,14 @@ class TestPyHIPQSA(CustomTestCase):
                         )
                     self.assertEqual(output.shape, (rows + 2, heads * 256))
                     self.assertTrue(bool((output[rows:] == 0).all()))
-                    self.assertEqual(len(backend._pyhip_attention.checked_layouts), 1)
+                    self.assertEqual(
+                        len(backend._pyhip_attention.checked_layouts),
+                        0 if declines else 1,
+                    )
                     # Prefixed chunks read the pool in place through the slot table; the
                     # gather fallback (a pool PyHIP cannot read in place) gives the same output.
-                    self.assertEqual(slot_reads, [pool_read])
-                    if pool_read:
+                    self.assertEqual(slot_reads, [] if declines else [pool_read])
+                    if pool_read and not declines:
                         with patch.object(
                             backend._pyhip_attention,
                             "can_read_kv_slots",

@@ -309,9 +309,12 @@ class Envs:
     # Split long PyHIP QSA prefill indexer rows across attention-TP ranks,
     # then all-gather the selections.
     SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER = EnvBool(False)
-    # With an FP8 KV cache, PyHIP QSA prefill attention runs FP8 MFMA kernels
-    # (FP8 Q and probabilities); off dequantizes the context to BF16 first.
+    # With an FP8 KV cache, QSA prefill attention (PyHIP or aiter) runs FP8 MFMA
+    # kernels (FP8 Q and probabilities); off dequantizes the context to BF16 first.
     SGLANG_OPT_PYHIP_QSA_FP8_MFMA = EnvBool(True)
+    # With SGLANG_USE_PYHIP_QSA, run QSA prefill attention through aiter's
+    # qsa_sparse_prefill instead of PyHIP; the indexer stays on PyHIP.
+    SGLANG_USE_AITER_QSA_PREFILL = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

@@ -28,7 +28,7 @@ from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_exec, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -268,6 +268,48 @@ class TestPyHIPQSA(CustomTestCase):
         self._check_attention_cache_and_padding(
             is_draft_worker=False, kv_dtype=torch.float8_e4m3fnuz, aiter=True
         )
+
+    def test_aiter_batch_invariant_follows_deterministic_inference(self):
+        """--enable-deterministic-inference reaches aiter as batch_invariant=True; an entry
+        without that parameter is still called, with a warning, instead of raising."""
+        if importlib.util.find_spec("aiter") is None:
+            self.skipTest("aiter is not installed")
+        calls = []
+
+        def entry(q, k, v, indices, *, kv_slots=None, batch_invariant=False, **kw):
+            calls.append(batch_invariant)
+            return q
+
+        def legacy(q, k, v, indices, *, kv_slots=None, **kw):
+            calls.append("legacy")
+            return q
+
+        q = torch.zeros((1, 12, 256), dtype=torch.bfloat16, device=self.device)
+        kv = torch.zeros((1, 1, 256), dtype=torch.bfloat16, device=self.device)
+        indices = torch.zeros((1, 2051), dtype=torch.int32, device=self.device)
+        target = "sglang.srt.layers.attention.qsa.aiter_prefill"
+        for deterministic in (False, True):
+            with get_exec().deterministic.override(
+                enable_deterministic_inference=deterministic
+            ):
+                for stub in (entry, legacy):
+                    with patch("aiter.ops.qsa.qsa_sparse_prefill", stub):
+                        warns = deterministic and stub is legacy
+                        with (self.assertLogs if warns else self.assertNoLogs)(
+                            target, "WARNING"
+                        ):
+                            adapter = AiterQSAAttention(kv_cache_dtype=torch.bfloat16)
+                        adapter.forward(
+                            q=q,
+                            k=kv,
+                            v=kv,
+                            indices=indices,
+                            query_lens=(1,),
+                            prefix_lens=(0,),
+                            scale=1 / 16,
+                            layer_id=3,
+                        )
+        self.assertEqual(calls, [False, "legacy", True, "legacy"])
 
     def _check_attention_cache_and_padding(
         self, *, is_draft_worker, kv_dtype=torch.bfloat16, fp8_mfma=True, aiter=False

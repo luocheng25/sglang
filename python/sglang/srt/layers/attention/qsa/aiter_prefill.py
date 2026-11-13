@@ -14,6 +14,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +24,25 @@ class AiterQSAAttention:
         from aiter.ops.qsa import qsa_sparse_prefill
 
         self.attention = qsa_sparse_prefill
+        parameters = inspect.signature(qsa_sparse_prefill).parameters
         self.validate = envs.SGLANG_TEST_PYHIP_QSA.get()
         # FP8 K/V: FP8 MFMA (FP8 Q and probabilities), or dequantized to BF16.
         self.fp8_compute = "fp8" if envs.SGLANG_OPT_PYHIP_QSA_FP8_MFMA.get() else "bf16"
         # FP8 K/V arrive with aiter's FP8 port, which adds k_scale/v_scale/compute.
         self.fp8_kv_unsupported = (
-            kv_cache_dtype == torch.float8_e4m3fnuz
-            and "k_scale" not in inspect.signature(qsa_sparse_prefill).parameters
+            kv_cache_dtype == torch.float8_e4m3fnuz and "k_scale" not in parameters
         )
+        # batch_invariant=True makes every numerical routing decision per request.
+        self.batch_invariant = {}
+        if get_exec().deterministic.enable_deterministic_inference:
+            if "batch_invariant" in parameters:
+                self.batch_invariant = dict(batch_invariant=True)
+            else:
+                logger.warning(
+                    "--enable-deterministic-inference: the installed aiter "
+                    "qsa_sparse_prefill takes no batch_invariant, so QSA prefill "
+                    "attention still routes by the whole batch"
+                )
         self.checked_layouts = set()
         self.served_layers = set()
         self.declined_layers = set()
@@ -102,6 +114,7 @@ class AiterQSAAttention:
             prefix_lens=prefix_lens,
             softmax_scale=scale,
             kv_slots=kv_slots,
+            **self.batch_invariant,
             **fp8,
         )
         if layer_id not in self.served_layers:

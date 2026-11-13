@@ -263,11 +263,16 @@ class TestPyHIPQSA(CustomTestCase):
     @torch.no_grad()
     def test_aiter_fp8_cache_attention(self):
         """Without aiter FP8 K/V support the adapter declines an FP8 pool with a logged
-        reason and SGLang's kernel serves the layer; with it, the pool is read as above.
+        reason and SGLang's kernel serves the layer; with it, the pool is read as above,
+        in the compute mode SGLANG_OPT_PYHIP_QSA_FP8_MFMA selects.
         """
-        self._check_attention_cache_and_padding(
-            is_draft_worker=False, kv_dtype=torch.float8_e4m3fnuz, aiter=True
-        )
+        for fp8_mfma in (True, False):
+            self._check_attention_cache_and_padding(
+                is_draft_worker=False,
+                kv_dtype=torch.float8_e4m3fnuz,
+                fp8_mfma=fp8_mfma,
+                aiter=True,
+            )
 
     def test_aiter_batch_invariant_follows_deterministic_inference(self):
         """--enable-deterministic-inference reaches aiter as batch_invariant=True; an entry

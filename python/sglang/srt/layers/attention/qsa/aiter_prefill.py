@@ -37,6 +37,10 @@ class AiterQSAAttention:
         if get_exec().deterministic.enable_deterministic_inference:
             if "batch_invariant" in parameters:
                 self.batch_invariant = dict(batch_invariant=True)
+                logger.info(
+                    "--enable-deterministic-inference: aiter QSA prefill attention "
+                    "passes batch_invariant=True"
+                )
             else:
                 logger.warning(
                     "--enable-deterministic-inference: the installed aiter "
@@ -119,7 +123,14 @@ class AiterQSAAttention:
         )
         if layer_id not in self.served_layers:
             self.served_layers.add(layer_id)
-            logger.info("aiter QSA prefill attention serves layer %s", layer_id)
+            logger.info(
+                "aiter QSA prefill attention serves layer %s "
+                "(K/V %s%s, batch_invariant=%s)",
+                layer_id,
+                k.dtype,
+                f", compute={fp8['compute']}" if fp8 else "",
+                bool(self.batch_invariant),
+            )
         layout = (layer_id, tuple(query_lens), tuple(prefix_lens), q.shape[1], scale)
         if self.validate and layout not in self.checked_layouts:
             from sglang.test.qsa_validation import check_attention
